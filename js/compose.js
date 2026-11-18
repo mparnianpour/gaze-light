@@ -44,9 +44,12 @@ export function analyze(seg) {
 }
 
 // segs: [{ pid, seg }] → { seed, palette, fills: { [pid]: number[] (colour index or -1 per segment) } }
-export function generate(segs, { cover = 0.5, seed = (Math.random() * 2 ** 31) | 0 } = {}) {
+export function generate(segs, { cover = 0.5, seed = (Math.random() * 2 ** 31) | 0, avoid = null } = {}) {
   const r = rng(seed);
-  const palette = PALETTES[Math.floor(r() * PALETTES.length)];
+  let pi = Math.floor(r() * PALETTES.length);
+  // Never the same palette twice in a row.
+  if (avoid && PALETTES[pi].join() === avoid.join()) pi = (pi + 1 + Math.floor(r() * (PALETTES.length - 1))) % PALETTES.length;
+  const palette = PALETTES[pi];
   const fills = {};
   for (const { pid, seg } of segs) {
     analyze(seg);

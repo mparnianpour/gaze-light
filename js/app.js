@@ -345,6 +345,7 @@ function compositionPixels(comp) {
 }
 
 let savedCursor = 0;
+let lastPalette = null;
 function nextComposition() {
   if (!segState) return null;
   const saved = usableSaved(segState.segAt);
@@ -353,8 +354,9 @@ function nextComposition() {
   if (saved.length && (src === 'saved' || (src === 'mix' && Math.random() < 0.35))) {
     comp = saved[savedCursor++ % saved.length];
   } else {
-    comp = generate(segState.entries.map((e) => ({ pid: e.pid, seg: e.seg })), { cover: settings.seg.cover });
+    comp = generate(segState.entries.map((e) => ({ pid: e.pid, seg: e.seg })), { cover: settings.seg.cover, avoid: lastPalette });
   }
+  lastPalette = comp.palette;
   return { comp, pixels: compositionPixels(comp) };
 }
 
