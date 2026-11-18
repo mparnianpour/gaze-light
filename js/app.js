@@ -1,5 +1,5 @@
 import { $, $$, sleep, load, save, remove, esc, abortError, params } from './util.js';
-import { loadOpenCV } from './cv.js';
+import { Vision } from './vision.js';
 import { Camera } from './camera.js';
 import { Output } from './output.js';
 import { calibrate, applyH } from './calibrate.js';
@@ -24,7 +24,10 @@ let flashBack = 'camera';
 let flashTimer = 0;
 let abortCal = null;
 
-const cvReady = loadOpenCV();
+// OpenCV.js runs in a background worker so its large download and start-up
+// never freeze the page.
+const vision = new Vision();
+let visionState = 'loading';   // 'loading' | 'ready' | 'failed'
 
 // ------------------------------------------------------------------ modes
 
@@ -177,7 +180,7 @@ function renderCard() {
     <p class="small">${esc(stats.join(' · '))}. <span class="muted">1 px is one phone-screen pixel, about ${(100 / output.w).toFixed(2)}% of the projected width.</span></p>
     ${r.warnings?.length ? `<ul>${r.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}
     ${locks ? `<div class="chips" style="margin-top:6px">${locks}</div>` : ''}
-    ${r.ok ? '<p class="small" style="margin-top:8px">Tap anything in the camera view. The screen goes dark and a cross is projected onto that spot.</p>' : ''}
+    ${r.ok ? '<p class="small" style="margin-top:8px">Tap anything in the camera view. The screen goes dark and a cross is projected onto that spot. Press Done to tap anywhere in the full view.</p>' : ''}
     ${!r.ok && calib ? '<p class="muted small">Your previous calibration is still in use.</p>' : ''}
     <div class="row">
       <button data-act="calibrate" class="${r.ok ? '' : 'primary'}">Redo</button>
@@ -275,10 +278,9 @@ $('#cam').addEventListener('resize', () => { drawOverlay(); renderStatus(); rend
 async function runCalibration() {
   if (mode === 'calibrating') return;
   closePanel();
-  let cv;
   try {
-    cv = await Promise.race([cvReady, sleep(150).then(() => null)]);
-    if (!cv) { toast('Loading the vision library…', 60000); cv = await cvReady; }
+    if (visionState !== 'ready') toast('Loading the vision library…', 90000);
+    await vision.ready;
   } catch {
     toast('The vision library (OpenCV.js) did not load. Check the internet and reload.', 6000);
     return;
@@ -306,7 +308,7 @@ async function runCalibration() {
     await sleep(500);
     const [cols, rows] = settings.grid.split('x').map(Number);
     const dotR = (settings.dotSize / 100) * Math.min(output.w, output.h);
-    lastResult = await calibrate({ cv, camera, output, cols, rows, dotR, signal });
+    lastResult = await calibrate({ vision, camera, output, cols, rows, dotR, signal });
     lastResult.locks = camera.locks;
     lastResult.lockValues = camera.lockedValues;
   } catch (e) {
@@ -443,16 +445,21 @@ output.onresize = () => {
   drawOverlay();
 };
 
-function startNote(extra = '') {
+let startExtra = params.has('sim') ? 'Test mode: the camera is simulated.' : '';
+function startNote(extra = startExtra) {
+  startExtra = extra;
   const parts = [];
+  if (visionState === 'loading') parts.push('Loading the vision library…');
+  if (visionState === 'ready') parts.push('Vision library ready.');
+  if (visionState === 'failed') parts.push('The vision library did not load. Check the internet and reload.');
   if (calib) parts.push(`Saved calibration from ${timeText(calib.date)}.`);
   if (extra) parts.push(extra);
   $('#startNote').textContent = parts.join(' ');
 }
 
-cvReady.then(
-  () => { if (mode === 'start') startNote(); },
-  () => startNote('The vision library did not load. Check the internet and reload.'),
+vision.ready.then(
+  (info) => { visionState = 'ready'; console.info('OpenCV ready in', info?.ms, 'ms'); startNote(); },
+  (e) => { visionState = 'failed'; console.error(e); startNote(); },
 );
 
 $('#startBtn').addEventListener('click', async () => {
@@ -477,8 +484,15 @@ $('#startBtn').addEventListener('click', async () => {
 
 $('#ver').textContent = VERSION;
 bindSettings();
-startNote(params.has('sim') ? 'Test mode: the camera is simulated.' : '');
+startNote();
 setMode('start');
 
 // For testing from the browser console.
-window.gaze = { settings, camera, output, get calib() { return calib; }, get lastResult() { return lastResult; }, runCalibration, setMode };
+window.gaze = {
+  settings, camera, output, vision,
+  get calib() { return calib; },
+  get lastResult() { return lastResult; },
+  get mode() { return mode; },
+  get visionState() { return visionState; },
+  runCalibration, setMode,
+};

@@ -6,6 +6,9 @@
 // dot pairs, OpenCV fits a homography: a mapping from camera image to phone
 // screen that holds for any point on the (flat) wall.
 //
+// The image work runs in the vision worker (vision-core.js); this file only
+// decides what to show and when.
+//
 // Coordinates:
 //   camera  — normalised to the camera frame, u,v in 0..1 (independent of resolution)
 //   screen  — CSS pixels of the full-screen output canvas
@@ -32,86 +35,35 @@ export function invertH(m) {
 // ---------- dot detection ----------
 
 class DotDetector {
-  constructor(cv, camera, procW) {
-    this.cv = cv;
+  constructor(vision, camera, procW) {
+    this.vision = vision;
     this.camera = camera;
     this.procW = procW;
-    this.ref = null;               // the "black" reference frame (grey)
-    this.diff = new cv.Mat();
-    this.blur = new cv.Mat();
-    this.empty = new cv.Mat();
-    this.ksize = new cv.Size(7, 7);
     this.thresh = 20;
+    this.noise = 0;
     this.latencies = [];
   }
 
-  dispose() {
-    for (const m of [this.ref, this.diff, this.blur, this.empty]) m?.delete();
-    this.ref = null;
-  }
-
-  async gray() {
+  async grab() {
     await this.camera.nextFrame();
-    const img = this.camera.grab(this.procW);
-    const rgba = this.cv.matFromImageData(img);
-    const g = new this.cv.Mat();
-    this.cv.cvtColor(rgba, g, this.cv.COLOR_RGBA2GRAY);
-    rgba.delete();
-    return g;
+    return this.camera.grab(this.procW);
   }
 
   async captureRef(n = 4) {
-    const cv = this.cv;
-    let acc = null;
-    for (let i = 0; i < n; i++) {
-      const g = await this.gray();
-      if (!acc) acc = g;
-      else { cv.addWeighted(acc, i / (i + 1), g, 1 / (i + 1), 0, acc); g.delete(); }
-    }
-    this.ref?.delete();
-    this.ref = acc;
+    await this.vision.call('refStart');
+    for (let i = 0; i < n; i++) await this.vision.withFrame('refAdd', await this.grab());
   }
 
-  // Brightest spot of (frame − black), after a little blur to ignore sensor noise.
-  measure(g) {
-    const cv = this.cv;
-    cv.subtract(g, this.ref, this.diff, this.empty, -1); // negative values clamp to 0
-    cv.GaussianBlur(this.diff, this.blur, this.ksize, 0, 0, cv.BORDER_DEFAULT);
-    const m = cv.minMaxLoc(this.blur, this.empty);
-    return { peak: m.maxVal, x: m.maxLoc.x, y: m.maxLoc.y };
+  async measure(extra) {
+    return this.vision.withFrame('measure', await this.grab(), extra);
   }
 
   // How bright "nothing" looks, so the dot threshold adapts to the room.
   async measureNoise(n = 4) {
     let worst = 0;
-    for (let i = 0; i < n; i++) {
-      const g = await this.gray();
-      worst = Math.max(worst, this.measure(g).peak);
-      g.delete();
-    }
+    for (let i = 0; i < n; i++) worst = Math.max(worst, (await this.measure()).peak);
     this.noise = worst;
     this.thresh = Math.max(18, worst * 2 + 10);
-  }
-
-  // Weighted centre of the bright blob around the peak (sub-pixel).
-  centroid(m) {
-    const w = this.blur.cols;
-    const h = this.blur.rows;
-    const d = this.blur.data;
-    const R = Math.max(8, Math.round(w * 0.04));
-    const x0 = Math.max(0, m.x - R), x1 = Math.min(w - 1, m.x + R);
-    const y0 = Math.max(0, m.y - R), y1 = Math.min(h - 1, m.y + R);
-    const t = m.peak * 0.4;
-    let sw = 0, sx = 0, sy = 0, n = 0;
-    for (let y = y0; y <= y1; y++) {
-      const row = y * w;
-      for (let x = x0; x <= x1; x++) {
-        const v = d[row + x] - t;
-        if (v > 0) { sw += v; sx += v * x; sy += v * y; n++; }
-      }
-    }
-    const box = (x1 - x0 + 1) * (y1 - y0 + 1);
-    return { x: sx / sw, y: sy / sw, fill: n / box, peak: m.peak };
   }
 
   get timeout() {
@@ -129,75 +81,51 @@ class DotDetector {
     const t0 = performance.now();
     let run = [];
     let found = null;
+    let size = null;
     while (performance.now() - t0 < timeout) {
       throwIfAborted(signal);
-      const g = await this.gray();
-      const m = this.measure(g);
-      g.delete();
+      const m = await this.measure();
+      size = m;
       if (m.peak < this.thresh) { run = []; continue; }
-      const c = this.centroid(m);
-      if (c.fill > 0.6) { run = []; continue; } // a big area changed: not a dot
+      if (m.fill > 0.6) { run = []; continue; } // a big area changed: not a dot
       const last = run[run.length - 1];
-      if (last && Math.hypot(c.x - last.x, c.y - last.y) < 2.5 && c.peak >= last.peak * 0.85) run.push(c);
-      else run = [c];
+      if (last && Math.hypot(m.cx - last.cx, m.cy - last.cy) < 2.5 && m.peak >= last.peak * 0.85) run.push(m);
+      else run = [m];
       if (run.length >= 3) {
-        const a = run[run.length - 1], b = run[run.length - 2];
-        found = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, peak: a.peak };
+        const a = run[run.length - 1];
+        const b = run[run.length - 2];
+        found = { x: (a.cx + b.cx) / 2, y: (a.cy + b.cy) / 2, peak: a.peak };
         this.latencies.push(performance.now() - t0);
         break;
       }
     }
     hide();
-    const w = this.blur.cols, h = this.blur.rows;
     const t1 = performance.now();
     while (performance.now() - t1 < timeout) {
       throwIfAborted(signal);
-      const g = await this.gray();
-      const m = this.measure(g);
-      if (m.peak < this.thresh * 0.5) {
-        // Dot is gone. Blend this frame into the black reference to follow slow drift.
-        this.cv.addWeighted(this.ref, 0.5, g, 0.5, 0, this.ref);
-        g.delete();
-        break;
-      }
-      g.delete();
+      // Once the dot is gone, this frame is blended into the black reference.
+      const m = await this.measure({ blendBelow: this.thresh * 0.5 });
+      if (m.blended) break;
     }
-    if (!found) return null;
-    return { u: (found.x + 0.5) / w, v: (found.y + 0.5) / h, peak: found.peak };
+    if (!found || !size) return null;
+    return { u: (found.x + 0.5) / size.w, v: (found.y + 0.5) / size.h, peak: found.peak };
   }
 }
 
 // ---------- homography fit ----------
 
-function fit(cv, pts, ransacPx) {
-  const toMats = (list) => [
-    cv.matFromArray(list.length, 1, cv.CV_32FC2, list.flatMap((p) => [p.c.u, p.c.v])),
-    cv.matFromArray(list.length, 1, cv.CV_32FC2, list.flatMap((p) => p.s)),
-  ];
-  const [src, dst] = toMats(pts);
-  const mask = new cv.Mat();
-  const Hr = cv.findHomography(src, dst, cv.RANSAC, ransacPx, mask);
-  let H = null;
-  let inliers = [];
-  if (!Hr.empty()) {
-    inliers = pts.filter((_, i) => mask.data[i]);
-    if (inliers.length >= 4) {
-      // Refine with a plain least-squares fit on the inliers only.
-      const [s2, d2] = toMats(inliers);
-      const m2 = new cv.Mat();
-      const H2 = cv.findHomography(s2, d2, 0, 3, m2);
-      if (!H2.empty()) H = Array.from(H2.data64F);
-      H2.delete(); s2.delete(); d2.delete(); m2.delete();
-    }
-  }
-  Hr.delete(); src.delete(); dst.delete(); mask.delete();
-  if (H) H = H.map((v) => v / H[8]);
-  return { H, inliers };
+async function fit(vision, pts, ransacPx) {
+  const { H, mask } = await vision.call('fit', {
+    src: pts.flatMap((p) => [p.c.u, p.c.v]),
+    dst: pts.flatMap((p) => p.s),
+    ransac: ransacPx,
+  });
+  return { H, inliers: pts.filter((_, i) => mask[i]) };
 }
 
 // ---------- main entry ----------
 
-export async function calibrate({ cv, camera, output, cols = 5, rows = 4, dotR, procW = 1280, signal, onProgress }) {
+export async function calibrate({ vision, camera, output, cols = 5, rows = 4, dotR, procW = 1280, signal, onProgress }) {
   const W = output.w;
   const Hs = output.h;
   const r = Math.max(4, dotR || Math.min(W, Hs) * 0.025);
@@ -213,7 +141,7 @@ export async function calibrate({ cv, camera, output, cols = 5, rows = 4, dotR, 
   // Extra dots between the grid points, used only to check the result.
   const checks = [[0.37, 0.41], [0.63, 0.33], [0.53, 0.69], [0.27, 0.71]].map(([a, b]) => ({ s: [W * a, Hs * b], c: null }));
 
-  const det = new DotDetector(cv, camera, Math.min(procW, camera.width));
+  const det = new DotDetector(vision, camera, Math.min(procW, camera.width));
   const t0 = performance.now();
   const base = {
     ok: false,
@@ -239,13 +167,8 @@ export async function calibrate({ cv, camera, output, cols = 5, rows = 4, dotR, 
     }
 
     const seen = grid.filter((p) => p.c);
-    const result = {
-      ...base,
-      found: seen.length,
-      noise: det.noise,
-      threshold: det.thresh,
-      points: grid.map((p) => ({ s: p.s, c: p.c ? [p.c.u, p.c.v] : null, inlier: false })),
-    };
+    const pointList = () => grid.map((p) => ({ s: p.s, c: p.c ? [p.c.u, p.c.v] : null, inlier: !!p.inlier }));
+    const result = { ...base, found: seen.length, noise: det.noise, threshold: det.thresh, points: pointList() };
     const done = (extra) => ({ ...result, ...extra, seconds: (performance.now() - t0) / 1000 });
 
     if (seen.length < 6) {
@@ -258,7 +181,7 @@ export async function calibrate({ cv, camera, output, cols = 5, rows = 4, dotR, 
       });
     }
 
-    const { H, inliers } = fit(cv, seen, Math.max(4, W * 0.012));
+    const { H, inliers } = await fit(vision, seen, Math.max(4, W * 0.012));
     if (!H || inliers.length < 6) {
       return done({
         reason: 'The dots did not fit one flat surface.',
@@ -266,7 +189,7 @@ export async function calibrate({ cv, camera, output, cols = 5, rows = 4, dotR, 
       });
     }
     for (const p of inliers) p.inlier = true;
-    result.points = grid.map((p) => ({ s: p.s, c: p.c ? [p.c.u, p.c.v] : null, inlier: !!p.inlier }));
+    result.points = pointList();
 
     const errs = inliers.map((p) => {
       const [x, y] = applyH(H, p.c.u, p.c.v);
@@ -319,7 +242,6 @@ export async function calibrate({ cv, camera, output, cols = 5, rows = 4, dotR, 
     out.ok = true;
     return out;
   } finally {
-    det.dispose();
     output.black();
   }
 }
