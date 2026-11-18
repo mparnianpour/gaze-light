@@ -310,6 +310,19 @@ export async function calibrate({ vision, camera, output, cols = 5, rows = 4, do
     if (coverage < 0.08) {
       return { ...out, reason: 'The dots the camera saw cover too little of the projection.', hints: ['Point the camera so it sees more of the projected area.'] };
     }
+    // Is the phone screen's horizontal running up/down in the camera picture?
+    // Usually that means Smart View is casting in portrait, so the projector
+    // shows only a narrow, sideways strip.
+    if (out.Hinv) {
+      const aspect = camera.width / camera.height;
+      const toCam = (x, y) => { const [u, v] = applyH(out.Hinv, x, y); return [u * aspect, v]; };
+      const c0 = toCam(W / 2, Hs / 2);
+      const cx = toCam(W * 0.75, Hs / 2);
+      if (Math.abs(cx[1] - c0[1]) > Math.abs(cx[0] - c0[0])) {
+        out.sideways = true;
+        out.warnings.push('The projection looks turned sideways. If the projector shows a tall narrow strip, the phone is casting in portrait: turn on Auto rotate on the phone (or pick a full-screen option in Smart View), then calibrate again.');
+      }
+    }
     if (inliers.length < seen.length) out.warnings.push(`${seen.length - inliers.length} dot(s) were ignored as reflections or mistakes.`);
     if (seen.length < grid.length) out.warnings.push(`${grid.length - seen.length} dot(s) were outside the camera view or too dim.`);
     if (coverage < 0.25) out.warnings.push(`The dots seen cover only ${Math.round(coverage * 100)}% of the projection; the light may be less accurate outside that area.`);
