@@ -12,7 +12,7 @@ GitHub Pages so Chrome gets HTTPS (needed for the camera).
 ## Status
 
 - [x] **Milestone 1** — camera, black fullscreen output, calibration with visible confirmation
-- [ ] Milestone 2 — tap painting corners, soft-brush test light
+- [x] **Milestone 2** — tap painting corners, flatten and save them, soft-brush test light
 - [ ] Milestone 3 — Claude reading, moving light, spoken narration
 - [ ] Milestone 4 — polish, settings, saving and loading
 
@@ -29,6 +29,22 @@ GitHub Pages so Chrome gets HTTPS (needed for the camera).
    onto that spot on the wall.
 
 The menu is behind the **top-right corner** (☰ in the camera view, invisible on the black screen).
+
+## Using milestone 2
+
+1. **Paintings** (button in the camera view): tap the 4 corners of a painting, in any order.
+   Press on a corner and drag to adjust it; a magnifier shows what is under your finger.
+   Tap 4 more corners for the next painting. Tap inside a painting to select it (to delete it).
+2. **Capture images**: the projector goes black (or warm white, see the menu), the camera
+   takes one frame and each painting is flattened. The review shows what Claude will look at;
+   rename the paintings there.
+3. **Test light**: tap a spot in the camera view (or press and drag to set its size).
+   The screen goes dark and the soft light blooms on that spot on the wall.
+   While it's lit, tap the dark screen anywhere to move the light there (old spot fades,
+   new one blooms); double-tap to go back.
+4. Light settings in the menu: brightness, size, softness, falloff distance, transition, colour.
+
+Paintings, corners and images are saved on the phone and survive a reload.
 
 The calibration is saved on the phone. It stays valid as long as the phone, tripod and
 projector don't move and the page is fullscreen.

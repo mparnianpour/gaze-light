@@ -34,11 +34,13 @@ export class Output {
     g.restore();
   }
 
-  white() {
+  white() { this.fill('#fff'); }
+
+  fill(color) {
     const g = this.ctx;
     g.save();
     g.setTransform(1, 0, 0, 1, 0, 0);
-    g.fillStyle = '#fff';
+    g.fillStyle = color;
     g.fillRect(0, 0, this.canvas.width, this.canvas.height);
     g.restore();
   }

@@ -35,17 +35,20 @@ p { margin: 0; }
 .small { font-size: 13px; }
 
 /* ---- layers ---- */
-#out, #cam, #overlay { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+#out, #light, #cam, #overlay { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
 #out { z-index: 1; background: #000; }
 #cam { z-index: 2; object-fit: contain; background: #000; filter: brightness(var(--dim)); }
 #overlay { z-index: 3; }
+#light { z-index: 5; background: #000; display: none; }
+body[data-mode="light"] #light { display: block; }
 
 /* In these modes the projector output sits on top of everything. The camera
    keeps running underneath so frames still arrive for calibration. */
 body[data-mode="calibrating"] #out,
+body[data-mode="capturing"] #out,
 body[data-mode="black"] #out,
 body[data-mode="flash"] #out { z-index: 4; }
-body:not([data-mode="camera"]):not([data-mode="result"]) #overlay { display: none; }
+body:not([data-mode="camera"]):not([data-mode="result"]):not([data-mode="paintings"]):not([data-mode="testlight"]) #overlay { display: none; }
 
 /* ---- buttons and inputs ---- */
 button {
@@ -63,6 +66,7 @@ button.big { font-size: 20px; padding: 14px 44px; }
 button:disabled { opacity: .5; }
 
 select, input[type="range"] { width: 100%; margin-top: 6px; }
+input[type="color"] { width: 64px; height: 40px; padding: 0; border: 1px solid var(--line); border-radius: 8px; background: #222; }
 select {
   font: inherit; color: var(--fg); background: #222; border: 1px solid var(--line);
   border-radius: 8px; padding: 8px; min-height: 40px;
@@ -78,12 +82,14 @@ label { display: block; margin: 12px 0 0; font-size: 14px; }
 }
 body:not([data-mode="start"]) #start { display: none; }
 
-/* ---- setup toolbar (camera view only) ---- */
+/* ---- setup toolbar (camera views only) ---- */
 #toolbar {
   position: fixed; left: 12px; right: 12px; bottom: 10px; z-index: 6;
-  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  display: flex; flex-direction: column; gap: 6px; align-items: flex-start;
+  pointer-events: none;
 }
-body:not([data-mode="camera"]) #toolbar { display: none; }
+#toolbar > * { pointer-events: auto; }
+body:not([data-mode="camera"]):not([data-mode="paintings"]):not([data-mode="testlight"]) #toolbar { display: none; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .chip {
   background: rgba(0, 0, 0, 0.66); border: 1px solid var(--line); border-radius: 999px;
@@ -93,14 +99,25 @@ body:not([data-mode="camera"]) #toolbar { display: none; }
 .chip.bad { color: var(--bad); }
 .chip.warn { color: var(--warn); }
 
-/* ---- calibration result card ---- */
-#card {
+/* ---- calibration result card / capture review ---- */
+#card, #review {
   position: fixed; z-index: 6; left: 50%; bottom: 10px; transform: translateX(-50%);
   width: min(600px, calc(100% - 24px)); max-height: calc(100% - 20px); overflow-y: auto;
   background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px 16px;
   touch-action: pan-y;
 }
 body:not([data-mode="result"]) #card { display: none; }
+body:not([data-mode="review"]) #review { display: none; }
+#review { width: min(760px, calc(100% - 24px)); }
+#review .title { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
+.thumbs { display: flex; gap: 12px; flex-wrap: wrap; margin: 8px 0; }
+.thumb { display: flex; flex-direction: column; gap: 4px; width: 170px; }
+.thumb img { width: 170px; height: 120px; object-fit: contain; background: #111; border: 1px solid var(--line); border-radius: 6px; }
+.thumb input { font: inherit; font-size: 14px; color: var(--fg); background: #222; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+#paintList .item { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+#paintList img { width: 64px; height: 46px; object-fit: contain; background: #111; border-radius: 4px; }
+#paintList .grow { flex: 1; min-width: 0; }
+#paintList button { min-height: 36px; padding: 6px 10px; }
 #card .title { font-size: 22px; font-weight: 600; margin-bottom: 4px; }
 #card .title.ok { color: var(--ok); }
 #card .title.bad { color: var(--bad); }
@@ -121,8 +138,12 @@ body:not([data-mode="result"]) #card { display: none; }
 /* ---- hidden menu ---- */
 #hotspot { position: fixed; top: 0; right: 0; width: 72px; height: 72px; z-index: 9; }
 body[data-mode="calibrating"] #hotspot,
+body[data-mode="capturing"] #hotspot,
 body[data-mode="start"] #hotspot { display: none; }
 body[data-mode="camera"] #hotspot::after,
+body[data-mode="paintings"] #hotspot::after,
+body[data-mode="testlight"] #hotspot::after,
+body[data-mode="review"] #hotspot::after,
 body[data-mode="result"] #hotspot::after {
   content: "☰"; position: absolute; top: 10px; right: 12px; font-size: 22px; line-height: 1;
   padding: 8px 11px; border-radius: 10px; background: rgba(0, 0, 0, 0.55); border: 1px solid var(--line);

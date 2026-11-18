@@ -3,29 +3,7 @@
 // the app is "projecting" on the #out canvas, warped through a known
 // perspective, delayed like Miracast, with sensor noise. It lets the
 // calibration be tested end to end on a computer.
-import { invertH } from './calibrate.js';
-
-// Homography taking four points `src` to four points `dst` (8×8 solve, h33 = 1).
-function homography4(src, dst) {
-  const A = [];
-  for (let i = 0; i < 4; i++) {
-    const [x, y] = src[i];
-    const [u, v] = dst[i];
-    A.push([x, y, 1, 0, 0, 0, -u * x, -u * y, u]);
-    A.push([0, 0, 0, x, y, 1, -v * x, -v * y, v]);
-  }
-  for (let c = 0; c < 8; c++) {
-    let p = c;
-    for (let r = c + 1; r < 8; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
-    [A[c], A[p]] = [A[p], A[c]];
-    for (let r = 0; r < 8; r++) {
-      if (r === c) continue;
-      const f = A[r][c] / A[c][c];
-      for (let k = c; k < 9; k++) A[r][k] -= f * A[c][k];
-    }
-  }
-  return [...A.map((row, i) => row[8] / row[i]), 1];
-}
+import { invertH, homography4 } from './geometry.js';
 
 export async function startSim() {
   const W = 1280;

@@ -1,26 +1,38 @@
-import { $, $$, sleep, load, save, remove, esc, abortError, params } from './util.js';
+import { $, sleep, load, save, remove, esc, abortError, params } from './util.js';
 import { Vision } from './vision.js';
 import { Camera } from './camera.js';
 import { Output } from './output.js';
-import { calibrate, applyH } from './calibrate.js';
+import { calibrate } from './calibrate.js';
+import { applyH, pointInQuad } from './geometry.js';
+import { Light, LIGHT_DEFAULTS } from './light.js';
+import { Paintings } from './paintings.js';
 
-const VERSION = 'Milestone 1';
+const VERSION = 'Milestone 2';
 const KEY_SETTINGS = 'gaze.settings';
 const KEY_CALIB = 'gaze.calibration';
-const DEFAULTS = { v: 2, deviceId: null, camHeight: 1080, grid: '5x4', dotSize: 4, previewDim: 0.6 };
+const DEFAULTS = {
+  v: 3, deviceId: null, camHeight: 1080, grid: '5x4', dotSize: 4, previewDim: 0.6,
+  captureLight: 'black', light: { ...LIGHT_DEFAULTS },
+};
 
 const settings = { ...DEFAULTS, ...load(KEY_SETTINGS, {}) };
-if ((settings.v || 1) < 2) {
-  // The first version used smaller dots by default.
-  if (settings.dotSize === 2.5) settings.dotSize = DEFAULTS.dotSize;
-  settings.v = 2;
-}
+settings.light = { ...LIGHT_DEFAULTS, ...(settings.light || {}) };
+if ((settings.v || 1) < 2 && settings.dotSize === 2.5) settings.dotSize = DEFAULTS.dotSize; // old smaller default
+settings.v = DEFAULTS.v;
 const saveSettings = () => save(KEY_SETTINGS, settings);
 
 const body = document.body;
 const overlay = $('#overlay');
 const output = new Output($('#out'));
 const camera = new Camera($('#cam'));
+const light = new Light($('#light'));
+light.setParams(settings.light);
+const paintings = new Paintings();
+
+// OpenCV.js runs in a background worker so its large download and start-up
+// never freeze the page.
+const vision = new Vision();
+let visionState = 'loading';   // 'loading' | 'ready' | 'failed'
 
 let calib = load(KEY_CALIB, null);   // the calibration in use
 let lastResult = null;              // the latest attempt, shown on the result card
@@ -29,17 +41,16 @@ let flashBack = 'camera';
 let flashTimer = 0;
 let abortCal = null;
 
-// OpenCV.js runs in a background worker so its large download and start-up
-// never freeze the page.
-const vision = new Vision();
-let visionState = 'loading';   // 'loading' | 'ready' | 'failed'
-
 // ------------------------------------------------------------------ modes
 
 function setMode(m) {
+  const prev = mode;
   mode = m;
   body.dataset.mode = m;
-  if (m !== 'flash') output.black();
+  if (m !== 'flash' && m !== 'capturing') output.black();
+  if (prev === 'light' && m !== 'light') light.off();
+  if (m !== 'paintings') { edit.draft = []; edit.drag = null; edit.selected = null; }
+  renderToolbar();
   renderStatus();
   renderCard();
   drawOverlay();
@@ -104,11 +115,9 @@ function videoRect() {
   const h = vh * s;
   return { x: (innerWidth - w) / 2, y: (innerHeight - h) / 2, w, h };
 }
-
-function camToView(u, v) {
-  const r = videoRect();
-  return [r.x + u * r.w, r.y + v * r.h];
-}
+const camToView = (u, v) => { const r = videoRect(); return [r.x + u * r.w, r.y + v * r.h]; };
+const viewToCam = (x, y) => { const r = videoRect(); return [(x - r.x) / r.w, (y - r.y) / r.h]; };
+const camAspect = () => (camera.width && camera.height ? camera.width / camera.height : 16 / 9);
 
 // Why a saved calibration might not match the current setup.
 function calibIssues(c) {
@@ -138,27 +147,63 @@ function timeText(ms) {
   return new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+// A region of the camera picture (centre u,v; radius as a fraction of the
+// frame height) → an ellipse on the phone screen, through the calibration.
+function cameraRegionToScreen(u, v, rv) {
+  const H = calib.H;
+  const s0 = applyH(H, u, v);
+  const s1 = applyH(H, u + rv / camAspect(), v);
+  const s2 = applyH(H, u, v + rv);
+  return { center: s0, ax: [s1[0] - s0[0], s1[1] - s0[1]], ay: [s2[0] - s0[0], s2[1] - s0[1]] };
+}
+
 // ------------------------------------------------------------------ rendering
+
+const TOOLS = {
+  camera: [['calibrate', 'Calibrate', 'primary'], ['paintings', 'Paintings'], ['testlight', 'Test light'], ['black', 'Black screen']],
+  paintings: [['undo', 'Undo corner'], ['delete', 'Delete painting'], ['capture', 'Capture images', 'primary'], ['camera', 'Done']],
+  testlight: [['paintings', 'Paintings'], ['camera', 'Done', 'primary']],
+};
+
+function renderToolbar() {
+  const tools = (TOOLS[mode] || []).filter(([act]) => {
+    if (act === 'undo') return edit.draft.length > 0;
+    if (act === 'delete') return !!edit.selected;
+    return true;
+  });
+  $('#tools').innerHTML = tools.map(([act, label, cls]) => `<button data-act="${act}" class="${cls || ''}">${esc(label)}</button>`).join('');
+}
 
 function renderStatus() {
   const chips = [];
-  if (!calib) chips.push(['Not calibrated', 'warn']);
-  else {
-    const issues = calibIssues(calib);
-    if (issues.length) chips.push([`Calibration may be off: ${issues.join(', ')}`, 'bad']);
-    else chips.push([`Calibrated · ${calib.rms.toFixed(1)} px`, 'ok']);
+  if (mode === 'paintings') {
+    if (!edit.draft.length && !edit.selected) chips.push(['Tap the 4 corners of a painting · drag a corner to adjust', '']);
+    else if (edit.draft.length) chips.push([`Corner ${edit.draft.length} of 4`, '']);
+    else chips.push([`${paintings.get(edit.selected)?.name || 'Painting'} selected`, '']);
+    const stale = paintings.list.filter((p) => !p.image || p.image.stale).length;
+    if (paintings.list.length) chips.push([stale ? `${stale} painting(s) need Capture images` : 'Images captured', stale ? 'warn' : 'ok']);
+  } else if (mode === 'testlight') {
+    if (!calib) chips.push(['Calibrate first', 'bad']);
+    chips.push(['Tap or drag on the view: the light appears there', '']);
+  } else {
+    if (!calib) chips.push(['Not calibrated', 'warn']);
+    else {
+      const issues = calibIssues(calib);
+      if (issues.length) chips.push([`Calibration may be off: ${issues.join(', ')}`, 'bad']);
+      else chips.push([`Calibrated · ${calib.rms.toFixed(1)} px`, 'ok']);
+    }
+    if (paintings.list.length) chips.push([`${paintings.list.length} painting(s)`, 'ok']);
+    if (camera.locks) chips.push(...lockText(camera.locks));
+    if (!isFullscreen()) chips.push(['Not fullscreen', 'warn']);
+    if (camera.sim) chips.push(['Test mode: simulated camera', 'warn']);
   }
-  if (camera.locks) chips.push(...lockText(camera.locks));
-  if (!isFullscreen()) chips.push(['Not fullscreen', 'warn']);
-  if (camera.sim) chips.push(['Test mode: simulated camera', 'warn']);
-  if (calib && !calibIssues(calib).length) chips.push(['Tap the view to project a cross there', '']);
   $('#status').innerHTML = chips.map(([t, k]) => `<span class="chip ${k}">${esc(t)}</span>`).join('');
 
   $('#calStatus').textContent = calib
     ? `In use: ${timeText(calib.date)}, ${calib.inliers} dots, error ${calib.rms.toFixed(1)} px` +
       (calibIssues(calib).length ? ` (may be off: ${calibIssues(calib).join(', ')})` : '')
     : 'No calibration yet.';
-  $('#screenInfo').textContent = `Screen ${output.w} × ${output.h} (×${output.dpr})` + (isFullscreen() ? ', fullscreen' : ', not fullscreen');
+  $('#screenInfo').textContent = `Screen ${output.w} × ${output.h} (×${output.dpr})` + (isFullscreen() ? ', fullscreen' : ', not fullscreen') + ` · light: ${light.mode}`;
 }
 
 function renderCamInfo() {
@@ -178,7 +223,6 @@ function renderCard() {
   if (r.checkErr != null) stats.push(`check error ${r.checkErr.toFixed(1)} px`);
   if (r.seconds != null) stats.push(`${Math.round(r.seconds)} s`);
   const locks = lockText(r.locks).map(([t, k]) => `<span class="chip ${k}">${esc(t)}</span>`).join('');
-  // Numbers that help diagnose a failed calibration.
   const diag = [];
   if (r.flash?.seen) diag.push(`projector seen, delay ${(r.flash.latency / 1000).toFixed(2)} s, ${Math.round(r.flash.frac * 100)}% of view`);
   else if (r.flash) diag.push(`projector not seen (brightest change ${Math.round(r.flash.brightest)}, needed ${Math.round(r.flash.thresh)})`);
@@ -206,6 +250,98 @@ function renderCard() {
     </div>`;
 }
 
+async function renderReview(lightUsed) {
+  const items = await Promise.all(paintings.list.map(async (p) => ({ p, url: await paintings.imageURL(p) })));
+  const other = lightUsed === 'white' ? 'black' : 'white';
+  $('#review').innerHTML = `
+    <div class="title">Captured ${items.filter((i) => i.url).length} painting(s)</div>
+    <p class="muted small">Flattened from one camera frame, taken with ${lightUsed === 'white' ? 'the projector lighting the paintings' : 'the projector black'}. These are what Claude will look at. You can rename them here.</p>
+    <div class="thumbs">
+      ${items.map(({ p, url }) => `
+        <div class="thumb">
+          ${url ? `<img src="${url}" alt="">` : '<div class="muted small">No image</div>'}
+          <input data-rename="${esc(p.id)}" value="${esc(p.name)}" aria-label="Name">
+          <span class="muted small">${p.image ? `${p.image.w} × ${p.image.h}` : ''}</span>
+        </div>`).join('')}
+    </div>
+    <div class="row">
+      <button data-act="capture">Retake</button>
+      <button data-act="capture-${other}">Retake with ${other === 'white' ? 'projector light' : 'room light'}</button>
+      <button data-act="testlight">Test light</button>
+      <button data-act="camera" class="primary">Done</button>
+    </div>`;
+}
+
+async function renderPaintList() {
+  const el = $('#paintList');
+  if (!paintings.list.length) { el.innerHTML = '<p class="muted small">No paintings yet.</p>'; return; }
+  const items = await Promise.all(paintings.list.map(async (p) => ({ p, url: await paintings.imageURL(p) })));
+  el.innerHTML = items.map(({ p, url }) => `
+    <div class="item">
+      ${url ? `<img src="${url}" alt="">` : '<img alt="">'}
+      <div class="grow"><div>${esc(p.name)}</div><div class="muted small">${!p.image ? 'no image yet' : p.image.stale ? 'corners changed: capture again' : `${p.image.w} × ${p.image.h}`}</div></div>
+      <button data-del="${esc(p.id)}">Delete</button>
+    </div>`).join('');
+}
+
+function drawQuad(g, quad, { stroke, width = 2, dash = null }) {
+  const pts = quad.map(([u, v]) => camToView(u, v));
+  g.setLineDash(dash || []);
+  g.lineWidth = width;
+  g.strokeStyle = stroke;
+  g.beginPath();
+  pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
+  g.closePath();
+  g.stroke();
+  g.setLineDash([]);
+  return pts;
+}
+
+function drawLabel(g, text, x, y) {
+  g.font = '600 13px system-ui, sans-serif';
+  const w = g.measureText(text).width + 12;
+  g.fillStyle = 'rgba(0, 0, 0, 0.6)';
+  g.fillRect(x - w / 2, y - 11, w, 22);
+  g.fillStyle = '#ecd6ab';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText(text, x, y);
+  g.textAlign = 'start';
+  g.textBaseline = 'alphabetic';
+}
+
+function drawLoupe(g, x, y) {
+  const video = $('#cam');
+  if (!camera.width) return;
+  const R = 56;
+  const Z = 3;
+  const r = videoRect();
+  const s = r.w / camera.width;
+  const [u, v] = viewToCam(x, y);
+  const half = R / (s * Z);
+  let lx = x;
+  let ly = y - 110;
+  if (ly - R < 4) ly = y + 110;
+  lx = Math.min(innerWidth - R - 4, Math.max(R + 4, lx));
+  g.save();
+  g.beginPath();
+  g.arc(lx, ly, R, 0, Math.PI * 2);
+  g.clip();
+  g.fillStyle = '#000';
+  g.fillRect(lx - R, ly - R, R * 2, R * 2);
+  g.drawImage(video, u * camera.width - half, v * camera.height - half, half * 2, half * 2, lx - R, ly - R, R * 2, R * 2);
+  g.restore();
+  g.strokeStyle = '#ecd6ab';
+  g.lineWidth = 2;
+  g.beginPath();
+  g.arc(lx, ly, R, 0, Math.PI * 2);
+  g.stroke();
+  g.beginPath();
+  g.moveTo(lx - 10, ly); g.lineTo(lx + 10, ly);
+  g.moveTo(lx, ly - 10); g.lineTo(lx, ly + 10);
+  g.stroke();
+}
+
 function drawOverlay() {
   const dpr = window.devicePixelRatio || 1;
   const W = innerWidth;
@@ -217,13 +353,12 @@ function drawOverlay() {
   const g = overlay.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, W, H);
-  if (mode !== 'camera' && mode !== 'result') return;
+  if (!['camera', 'result', 'paintings', 'testlight'].includes(mode)) return;
 
   const c = mode === 'result' && lastResult ? lastResult : calib;
-  if (!c) return;
 
   // Without a fit yet: show where the camera saw the projector's white flash.
-  if (mode === 'result' && !c.Hinv && c.flash?.bbox) {
+  if (mode === 'result' && c && !c.Hinv && c.flash?.bbox) {
     const [u0, v0, u1, v1] = c.flash.bbox;
     const [x0, y0] = camToView(u0, v0);
     const [x1, y1] = camToView(u1, v1);
@@ -238,21 +373,60 @@ function drawOverlay() {
   }
 
   // Outline of what the projector can reach, as seen by the camera.
-  if (c.Hinv) {
-    const corners = [[0, 0], [c.screen.w, 0], [c.screen.w, c.screen.h], [0, c.screen.h]]
-      .map(([x, y]) => applyH(c.Hinv, x, y))
-      .map(([u, v]) => camToView(u, v));
-    g.setLineDash([8, 6]);
+  if (c?.Hinv && mode !== 'paintings') {
+    const corners = [[0, 0], [c.screen.w, 0], [c.screen.w, c.screen.h], [0, c.screen.h]].map(([x, y]) => applyH(c.Hinv, x, y));
+    drawQuad(g, corners, { stroke: 'rgba(236, 214, 171, 0.75)', dash: [8, 6] });
+  }
+
+  // Paintings.
+  if (mode !== 'result') {
+    for (const p of paintings.list) {
+      const selected = mode === 'paintings' && edit.selected === p.id;
+      const pts = drawQuad(g, p.corners, { stroke: selected ? '#ffffff' : 'rgba(255, 214, 140, 0.95)', width: selected ? 3 : 2 });
+      const cx = pts.reduce((a, q) => a + q[0], 0) / 4;
+      const cy = pts.reduce((a, q) => a + q[1], 0) / 4;
+      drawLabel(g, p.name, cx, cy);
+      if (mode === 'paintings') {
+        for (const [x, y] of pts) {
+          g.fillStyle = 'rgba(0, 0, 0, 0.5)';
+          g.beginPath(); g.arc(x, y, 9, 0, Math.PI * 2); g.fill();
+          g.strokeStyle = '#ffd68c'; g.lineWidth = 2;
+          g.beginPath(); g.arc(x, y, 9, 0, Math.PI * 2); g.stroke();
+        }
+      }
+    }
+  }
+
+  if (mode === 'paintings' && edit.draft.length) {
+    const pts = edit.draft.map(([u, v]) => camToView(u, v));
+    g.strokeStyle = '#ffffff';
     g.lineWidth = 2;
-    g.strokeStyle = 'rgba(236, 214, 171, 0.9)';
+    g.setLineDash([6, 4]);
     g.beginPath();
-    corners.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
-    g.closePath();
+    pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
     g.stroke();
     g.setLineDash([]);
+    pts.forEach(([x, y], i) => {
+      g.fillStyle = '#ffffff';
+      g.beginPath(); g.arc(x, y, 6, 0, Math.PI * 2); g.fill();
+      g.fillStyle = '#000';
+      g.font = '600 10px system-ui, sans-serif';
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(String(i + 1), x, y);
+      g.textAlign = 'start'; g.textBaseline = 'alphabetic';
+    });
   }
-  if (mode !== 'result' || !c.points) return;
 
+  if (mode === 'paintings' && edit.drag) drawLoupe(g, edit.drag.x, edit.drag.y);
+
+  if (mode === 'testlight' && test.down) {
+    const { x, y, r } = test.down;
+    g.strokeStyle = 'rgba(255, 241, 220, 0.9)';
+    g.lineWidth = 2;
+    g.beginPath(); g.arc(x, y, Math.max(6, r), 0, Math.PI * 2); g.stroke();
+  }
+
+  if (mode !== 'result' || !c?.points) return;
   for (const p of c.points) {
     if (p.c) {
       const [x, y] = camToView(p.c[0], p.c[1]);
@@ -306,19 +480,24 @@ camera.onended = () => {
 };
 $('#cam').addEventListener('resize', () => { drawOverlay(); renderStatus(); renderCamInfo(); });
 
+async function visionReady() {
+  try {
+    if (visionState !== 'ready') toast('Loading the vision library…', 90000);
+    await vision.ready;
+    $('#msg').classList.remove('show');
+    return true;
+  } catch {
+    toast('The vision library (OpenCV.js) did not load. Check the internet and reload.', 6000);
+    return false;
+  }
+}
+
 // ------------------------------------------------------------------ calibration
 
 async function runCalibration() {
   if (mode === 'calibrating') return;
   closePanel();
-  try {
-    if (visionState !== 'ready') toast('Loading the vision library…', 90000);
-    await vision.ready;
-  } catch {
-    toast('The vision library (OpenCV.js) did not load. Check the internet and reload.', 6000);
-    return;
-  }
-  $('#msg').classList.remove('show');
+  if (!(await visionReady())) return;
   if (!camera.running) {
     try { await startCamera(); } catch (e) { toast(cameraErrorText(e), 6000); return; }
   }
@@ -364,7 +543,198 @@ async function runCalibration() {
   setMode('result');
 }
 
-// ------------------------------------------------------------------ tap check
+// ------------------------------------------------------------------ paintings: corner editing
+
+const edit = { draft: [], drag: null, selected: null };
+const HIT = 26; // px, how close a tap must be to grab a corner
+
+function hitCorner(x, y) {
+  let best = null;
+  let bestD = HIT;
+  for (const p of paintings.list) {
+    p.corners.forEach(([u, v], i) => {
+      const [cx, cy] = camToView(u, v);
+      const d = Math.hypot(cx - x, cy - y);
+      if (d < bestD) { bestD = d; best = { painting: p, index: i }; }
+    });
+  }
+  edit.draft.forEach(([u, v], i) => {
+    const [cx, cy] = camToView(u, v);
+    const d = Math.hypot(cx - x, cy - y);
+    if (d < bestD) { bestD = d; best = { draft: true, index: i }; }
+  });
+  return best;
+}
+
+function clampCam([u, v]) { return [Math.min(1, Math.max(0, u)), Math.min(1, Math.max(0, v))]; }
+
+function editDown(e) {
+  const x = e.clientX;
+  const y = e.clientY;
+  const r = videoRect();
+  if (x < r.x || x > r.x + r.w || y < r.y || y > r.y + r.h) return;
+  const hit = hitCorner(x, y);
+  if (hit) {
+    edit.drag = { ...hit, x, y, id: e.pointerId };
+  } else if (!edit.draft.length) {
+    const cam = viewToCam(x, y);
+    const inside = paintings.list.find((p) => pointInQuad(cam, p.corners));
+    if (inside) { edit.selected = inside.id; renderToolbar(); renderStatus(); drawOverlay(); return; }
+    if (edit.selected) { edit.selected = null; renderToolbar(); renderStatus(); drawOverlay(); return; }
+    edit.draft.push(clampCam(cam));
+    edit.drag = { draft: true, index: edit.draft.length - 1, x, y, id: e.pointerId };
+  } else {
+    edit.draft.push(clampCam(viewToCam(x, y)));
+    edit.drag = { draft: true, index: edit.draft.length - 1, x, y, id: e.pointerId };
+  }
+  overlay.setPointerCapture?.(e.pointerId);
+  renderToolbar();
+  renderStatus();
+  drawOverlay();
+}
+
+function editMove(e) {
+  if (!edit.drag || e.pointerId !== edit.drag.id) return;
+  edit.drag.x = e.clientX;
+  edit.drag.y = e.clientY;
+  const cam = clampCam(viewToCam(e.clientX, e.clientY));
+  if (edit.drag.draft) edit.draft[edit.drag.index] = cam;
+  else edit.drag.painting.corners[edit.drag.index] = cam;
+  drawOverlay();
+}
+
+function editUp(e) {
+  if (!edit.drag || e.pointerId !== edit.drag.id) return;
+  const d = edit.drag;
+  edit.drag = null;
+  if (!d.draft) paintings.cornersChanged(d.painting, camAspect());
+  if (edit.draft.length === 4) {
+    const p = paintings.add(edit.draft, camAspect());
+    edit.draft = [];
+    toast(`${p.name} added. Tap 4 more corners for another painting, or Capture images.`, 3500);
+  }
+  renderToolbar();
+  renderStatus();
+  drawOverlay();
+}
+
+// ------------------------------------------------------------------ paintings: capture
+
+async function captureImages(lightUsed = settings.captureLight) {
+  closePanel();
+  if (!paintings.list.length) { toast('Tap the 4 corners of a painting first.'); setMode('paintings'); return; }
+  if (!(await visionReady())) return;
+  if (!camera.running) {
+    try { await startCamera(); } catch (e) { toast(cameraErrorText(e), 6000); return; }
+  }
+  setMode('capturing');
+  if (lightUsed === 'white') output.fill(settings.light.color || '#fff1dc');
+  else output.black();
+  // Give the projector time to change and the camera time to expose for the paintings.
+  await camera.unlock();
+  await sleep(2200);
+  await camera.nextFrame();
+  const img = camera.grab(4096);
+  const quads = paintings.list.map((p) => {
+    const [w, h] = paintings.flatSize(p, img.width, img.height);
+    return { corners: p.corners.map(([u, v]) => [u * img.width, v * img.height]), w, h };
+  });
+  try {
+    const flat = await vision.withFrame('warp', img, { quads });
+    for (let i = 0; i < flat.length; i++) await paintings.setImage(paintings.list[i], flat[i]);
+  } catch (e) {
+    console.error(e);
+    toast('Could not flatten the paintings: ' + e.message, 6000);
+    setMode('paintings');
+    return;
+  }
+  output.black();
+  await renderReview(lightUsed);
+  setMode('review');
+}
+
+$('#review').addEventListener('change', (e) => {
+  const id = e.target?.dataset?.rename;
+  if (id) { paintings.rename(id, e.target.value); renderPaintList(); }
+});
+
+$('#paintList').addEventListener('click', (e) => {
+  const id = e.target?.dataset?.del;
+  if (!id) return;
+  const p = paintings.get(id);
+  if (p && confirm(`Delete ${p.name}?`)) { paintings.remove(id); renderPaintList(); drawOverlay(); renderStatus(); }
+});
+
+// ------------------------------------------------------------------ test light
+
+const test = { down: null, lastR: null };
+let lightBack = 'testlight';
+
+function testDown(e) {
+  if (!calib?.H) { toast('Calibrate first, then the light can find the wall.'); return; }
+  const r = videoRect();
+  if (e.clientX < r.x || e.clientX > r.x + r.w || e.clientY < r.y || e.clientY > r.y + r.h) return;
+  test.down = { x: e.clientX, y: e.clientY, r: 0, id: e.pointerId };
+  overlay.setPointerCapture?.(e.pointerId);
+  drawOverlay();
+}
+
+function testMove(e) {
+  if (!test.down || e.pointerId !== test.down.id) return;
+  test.down.r = Math.hypot(e.clientX - test.down.x, e.clientY - test.down.y);
+  drawOverlay();
+}
+
+function testUp(e) {
+  if (!test.down || e.pointerId !== test.down.id) return;
+  const d = test.down;
+  test.down = null;
+  const r = videoRect();
+  const [u, v] = viewToCam(d.x, d.y);
+  const rv = d.r > 12 ? d.r / r.h : 0.06; // a plain tap gives a medium spot
+  const region = cameraRegionToScreen(u, v, rv);
+  const [sx, sy] = region.center;
+  if (sx < -20 || sy < -20 || sx > output.w + 20 || sy > output.h + 20) {
+    toast('That spot is outside what the projector can reach.');
+    drawOverlay();
+    return;
+  }
+  test.lastR = Math.sqrt(Math.hypot(...region.ax) * Math.hypot(...region.ay));
+  showLight(region, 'testlight');
+}
+
+function showLight(region, back) {
+  lightBack = back;
+  if (mode !== 'light') {
+    setMode('light');
+    toast('Tap to move the light · double-tap to go back', 2500);
+  }
+  light.show(region);
+}
+
+// In light mode the phone screen is the projection: tap where the light should go.
+let lastTap = null;
+let tapTimer = 0;
+$('#light').addEventListener('pointerup', (e) => {
+  if (mode !== 'light') return;
+  const now = performance.now();
+  if (lastTap && now - lastTap.t < 330 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 50) {
+    clearTimeout(tapTimer);
+    lastTap = null;
+    light.clear({ transition: 0.8 });
+    setTimeout(() => { if (mode === 'light') setMode(lightBack); }, 850);
+    return;
+  }
+  lastTap = { t: now, x: e.clientX, y: e.clientY };
+  const { clientX: x, clientY: y } = e;
+  clearTimeout(tapTimer);
+  tapTimer = setTimeout(() => {
+    const R = test.lastR || Math.min(output.w, output.h) * 0.09;
+    light.show({ center: [x, y], ax: [R, 0], ay: [0, R] });
+  }, 330);
+});
+
+// ------------------------------------------------------------------ tap check (cross)
 
 function flashCross(x, y) {
   if (mode !== 'flash') flashBack = mode;
@@ -374,13 +744,10 @@ function flashCross(x, y) {
   flashTimer = setTimeout(() => setMode(flashBack), 2500);
 }
 
-overlay.addEventListener('pointerdown', (e) => {
-  if (mode !== 'camera' && mode !== 'result') return;
+function crossDown(e) {
   const c = mode === 'result' && lastResult?.ok ? lastResult : calib;
   if (!c?.H) { toast('Calibrate first, then tap the view to test it.'); return; }
-  const r = videoRect();
-  const u = (e.clientX - r.x) / r.w;
-  const v = (e.clientY - r.y) / r.h;
+  const [u, v] = viewToCam(e.clientX, e.clientY);
   if (u < 0 || u > 1 || v < 0 || v > 1) return;
   const [x, y] = applyH(c.H, u, v);
   if (x < 0 || y < 0 || x > output.w || y > output.h) {
@@ -388,6 +755,26 @@ overlay.addEventListener('pointerdown', (e) => {
     return;
   }
   flashCross(x, y);
+}
+
+// ------------------------------------------------------------------ pointer routing
+
+overlay.addEventListener('pointerdown', (e) => {
+  if (mode === 'paintings') editDown(e);
+  else if (mode === 'testlight') testDown(e);
+  else if (mode === 'camera' || mode === 'result') crossDown(e);
+});
+overlay.addEventListener('pointermove', (e) => {
+  if (mode === 'paintings') editMove(e);
+  else if (mode === 'testlight') testMove(e);
+});
+overlay.addEventListener('pointerup', (e) => {
+  if (mode === 'paintings') editUp(e);
+  else if (mode === 'testlight') testUp(e);
+});
+overlay.addEventListener('pointercancel', (e) => {
+  if (mode === 'paintings') editUp(e);
+  test.down = null;
 });
 
 $('#out').addEventListener('pointerdown', () => {
@@ -397,7 +784,7 @@ $('#out').addEventListener('pointerdown', () => {
 
 // ------------------------------------------------------------------ menu
 
-function openPanel() { $('#panel').hidden = false; renderStatus(); renderCamInfo(); }
+function openPanel() { $('#panel').hidden = false; renderStatus(); renderCamInfo(); renderPaintList(); }
 function closePanel() { $('#panel').hidden = true; }
 $('#hotspot').addEventListener('click', () => ($('#panel').hidden ? openPanel() : closePanel()));
 
@@ -405,6 +792,16 @@ const actions = {
   calibrate: runCalibration,
   camera: () => { closePanel(); setMode('camera'); },
   black: () => { closePanel(); setMode('black'); toast('Tap the top-right corner for the menu.', 2000); },
+  paintings: () => { closePanel(); setMode('paintings'); },
+  testlight: () => { closePanel(); setMode('testlight'); },
+  capture: () => captureImages(),
+  'capture-white': () => { settings.captureLight = 'white'; saveSettings(); $('#setCapLight').value = 'white'; captureImages('white'); },
+  'capture-black': () => { settings.captureLight = 'black'; saveSettings(); $('#setCapLight').value = 'black'; captureImages('black'); },
+  undo: () => { edit.draft.pop(); renderToolbar(); renderStatus(); drawOverlay(); },
+  delete: () => {
+    const p = paintings.get(edit.selected);
+    if (p && confirm(`Delete ${p.name}?`)) { paintings.remove(p.id); edit.selected = null; renderToolbar(); renderStatus(); drawOverlay(); }
+  },
   forget: () => {
     if (!calib) return;
     if (!confirm('Forget the saved calibration?')) return;
@@ -413,6 +810,7 @@ const actions = {
     renderStatus();
     drawOverlay();
   },
+  warmwhite: () => setLight({ color: LIGHT_DEFAULTS.color }),
   fullscreen: async () => { await enterFullscreen(); renderStatus(); },
   voicetest: () => speak('This is the narration voice. If you can hear me, sound is working.'),
   reload: () => location.reload(),
@@ -422,7 +820,42 @@ document.addEventListener('click', (e) => {
   if (b && actions[b.dataset.act]) actions[b.dataset.act]();
 });
 
+function setLight(p) {
+  Object.assign(settings.light, p);
+  light.setParams(settings.light);
+  saveSettings();
+  syncLightControls();
+}
+
+const LIGHT_FMT = {
+  brightness: (v) => `${Math.round(v * 100)}%`,
+  size: (v) => `${Math.round(v * 100)}%`,
+  softness: (v) => `${Math.round(v * 100)}%`,
+  falloff: (v) => `${Math.round(v * 100)}%`,
+  transition: (v) => `${(+v).toFixed(1)} s`,
+};
+
+function syncLightControls() {
+  for (const el of document.querySelectorAll('[data-light]')) {
+    const k = el.dataset.light;
+    el.value = settings.light[k];
+    const o = $(`#o-${k}`);
+    if (o) o.textContent = LIGHT_FMT[k](settings.light[k]);
+  }
+  $('#setColor').value = settings.light.color;
+}
+
 function bindSettings() {
+  for (const el of document.querySelectorAll('[data-light]')) {
+    el.addEventListener('input', () => setLight({ [el.dataset.light]: +el.value }));
+  }
+  $('#setColor').addEventListener('input', (e) => setLight({ color: e.target.value }));
+  syncLightControls();
+
+  const cap = $('#setCapLight');
+  cap.value = settings.captureLight;
+  cap.addEventListener('change', () => { settings.captureLight = cap.value; saveSettings(); });
+
   const grid = $('#setGrid');
   grid.value = settings.grid;
   grid.addEventListener('change', () => { settings.grid = grid.value; saveSettings(); });
@@ -487,6 +920,7 @@ function startNote(extra = startExtra) {
   if (visionState === 'ready') parts.push('Vision library ready.');
   if (visionState === 'failed') parts.push('The vision library did not load. Check the internet and reload.');
   if (calib) parts.push(`Saved calibration from ${timeText(calib.date)}.`);
+  if (paintings.list.length) parts.push(`${paintings.list.length} painting(s) saved.`);
   if (extra) parts.push(extra);
   $('#startNote').textContent = parts.join(' ');
 }
@@ -523,10 +957,10 @@ setMode('start');
 
 // For testing from the browser console.
 window.gaze = {
-  settings, camera, output, vision,
+  settings, camera, output, vision, light, paintings,
   get calib() { return calib; },
   get lastResult() { return lastResult; },
   get mode() { return mode; },
   get visionState() { return visionState; },
-  runCalibration, setMode,
+  runCalibration, setMode, captureImages, cameraRegionToScreen, showLight,
 };

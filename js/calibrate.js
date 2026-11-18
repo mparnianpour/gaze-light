@@ -13,24 +13,9 @@
 //   camera  — normalised to the camera frame, u,v in 0..1 (independent of resolution)
 //   screen  — CSS pixels of the full-screen output canvas
 import { sleep, throwIfAborted } from './util.js';
+import { applyH, invertH } from './geometry.js';
 
-// ---------- small 3×3 helpers (used everywhere the light is mapped) ----------
-
-export function applyH(H, x, y) {
-  const w = H[6] * x + H[7] * y + H[8];
-  return [(H[0] * x + H[1] * y + H[2]) / w, (H[3] * x + H[4] * y + H[5]) / w];
-}
-
-export function invertH(m) {
-  const [a, b, c, d, e, f, g, h, i] = m;
-  const A = e * i - f * h;
-  const B = -(d * i - f * g);
-  const C = d * h - e * g;
-  const det = a * A + b * B + c * C;
-  if (!det) return null;
-  const inv = [A, -(b * i - c * h), b * f - c * e, B, a * i - c * g, -(a * f - c * d), C, -(a * h - b * g), a * e - b * d];
-  return inv.map((v) => v / det);
-}
+export { applyH, invertH };
 
 // ---------- dot detection ----------
 

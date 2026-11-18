@@ -126,6 +126,28 @@
         return { frac: n / total, mean: sum / total, peak, bbox, w, h };
       },
 
+      // Warp each painting flat. quads: [{ corners: [[x,y]×4 in frame pixels,
+      // TL TR BR BL], w, h }] → [{ width, height, buffer (RGBA) }].
+      warp({ frame, quads }) {
+        const src = cv.matFromImageData({
+          data: new Uint8ClampedArray(frame.buffer, 0, frame.width * frame.height * 4),
+          width: frame.width,
+          height: frame.height,
+        });
+        const out = quads.map((q) => {
+          const S = toMat(q.corners.flat());
+          const D = toMat([0, 0, q.w, 0, q.w, q.h, 0, q.h]);
+          const M = cv.getPerspectiveTransform(S, D);
+          const dst = new cv.Mat();
+          cv.warpPerspective(src, dst, M, new cv.Size(q.w, q.h), cv.INTER_LINEAR, cv.BORDER_REPLICATE, new cv.Scalar());
+          const buffer = new Uint8ClampedArray(dst.data).buffer;
+          S.delete(); D.delete(); M.delete(); dst.delete();
+          return { width: q.w, height: q.h, buffer };
+        });
+        src.delete();
+        return out;
+      },
+
       // Homography from src points to dst points: RANSAC to drop outliers,
       // then a least-squares refit on the inliers.
       fit({ src, dst, ransac }) {
