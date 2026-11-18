@@ -14,7 +14,9 @@ GitHub Pages so Chrome gets HTTPS (needed for the camera).
 - [x] **Milestone 1** — camera, black fullscreen output, calibration with visible confirmation
 - [x] **Milestone 2** — tap painting corners, flatten and save them, soft-brush test light
 - [x] **Milestone 3** — readings played on the wall: moving light and spoken narration (readings written ahead of time; no API needed)
-- [ ] Milestone 4 — polish, settings, saving and loading
+- [x] **Segments, step 1** — the painting's own segments filled with coloured light, compositions crossfading
+- [ ] Segments, step 2 — edit segments (merge, split, draw) and design compositions by hand
+- [ ] Milestone 4 — polish, colour correction, saving and loading
 
 ## Using milestone 1
 
@@ -46,7 +48,22 @@ The menu is behind the **top-right corner** (☰ in the camera view, invisible o
 
 Paintings, corners and images are saved on the phone and survive a reload.
 
-## Using milestone 3
+## Segments (colour compositions)
+
+"Segments over segments": the painting is cut into segments that follow its own shapes and
+colour areas, and compositions fill some of them with coloured light while the rest of the
+painting gets soft neutral light. One composition crossfades into the next.
+
+1. Calibrate, mark the painting's corners and **Capture images** (or, in the menu's painting
+   list, **Use my photo**: a photo cropped exactly to the canvas edges).
+2. Menu → Paintings → **Find segments** (also done automatically the first time).
+   **Show segments** projects the outlines onto the painting so you can check the fit; tap to close.
+3. Menu → Performance → *What to perform: Segments* → **Perform**.
+4. While it plays: **♥ Save this composition** keeps the one on the wall; *Compositions*
+   chooses new, saved, or both. Hold time, crossfade, colour coverage, light on the rest of
+   the painting and colour brightness are adjustable.
+
+## Using milestone 3 (gaze)
 
 1. Calibrate and mark the painting's corners (milestones 1 and 2).
 2. Menu → **Performance → Readings**: each painting named in the readings is linked to

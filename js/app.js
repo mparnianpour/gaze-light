@@ -3,29 +3,33 @@ import { Vision } from './vision.js';
 import { Camera } from './camera.js';
 import { Output } from './output.js';
 import { calibrate } from './calibrate.js';
-import { applyH, pointInQuad } from './geometry.js';
+import { applyH, invertH, pointInQuad } from './geometry.js';
 import { Light, LIGHT_DEFAULTS } from './light.js';
 import { Paintings } from './paintings.js';
 import { Voice } from './speech.js';
-import { Performer } from './perform.js';
+import { Performer, SegmentPerformer } from './perform.js';
+import { SegmentLight, SEG_DEFAULTS } from './seglight.js';
+import { generate, saveComposition, clearCompositions, usableSaved, savedCompositions } from './compose.js';
 
-const VERSION = 'Milestone 3';
+const VERSION = 'Segments · step 1';
 const KEY_SETTINGS = 'gaze.settings';
 const KEY_CALIB = 'gaze.calibration';
 const KEY_READINGS = 'gaze.readings';
 const VOICE_DEFAULTS = { voiceURI: null, rate: 0.95, pitch: 1, lang: 'en-US' };
-const PERFORM_DEFAULTS = { movement: 'dissolve', pauseBetween: 4 };
+const PERFORM_DEFAULTS = { kind: 'segments', movement: 'dissolve', pauseBetween: 4, speak: false };
 const DEFAULTS = {
   v: 3, deviceId: null, camHeight: 1080, grid: '5x4', dotSize: 4, previewDim: 0.6,
   captureLight: 'black', light: { ...LIGHT_DEFAULTS },
-  voice: { ...VOICE_DEFAULTS }, perform: { ...PERFORM_DEFAULTS }, links: {},
+  voice: { ...VOICE_DEFAULTS }, perform: { ...PERFORM_DEFAULTS }, links: {}, seg: { ...SEG_DEFAULTS },
 };
+const SEG_PARAMS = { k: 9, passes: 2, minFrac: 0.0012 };
 
 const settings = { ...DEFAULTS, ...load(KEY_SETTINGS, {}) };
 settings.light = { ...LIGHT_DEFAULTS, ...(settings.light || {}) };
 settings.voice = { ...VOICE_DEFAULTS, ...(settings.voice || {}) };
 settings.perform = { ...PERFORM_DEFAULTS, ...(settings.perform || {}) };
 settings.links = { ...(settings.links || {}) };
+settings.seg = { ...SEG_DEFAULTS, ...(settings.seg || {}) };
 if ((settings.v || 1) < 2 && settings.dotSize === 2.5) settings.dotSize = DEFAULTS.dotSize; // old smaller default
 settings.v = DEFAULTS.v;
 const saveSettings = () => save(KEY_SETTINGS, settings);
@@ -44,6 +48,13 @@ const performer = new Performer({
   regionFor: (stop) => paintingStopToScreen(stop),
   onStatus: (s) => renderPerfStatus(s),
 });
+const seglight = new SegmentLight($('#seg'));
+const segPerformer = new SegmentPerformer({
+  seglight, settings: settings.seg,
+  makeNext: () => nextComposition(),
+  onStatus: () => renderPerfStatus(),
+});
+let segState = null; // { entries, segAt } while segments are mapped onto the screen
 
 // OpenCV.js runs in a background worker so its large download and start-up
 // never freeze the page.
@@ -64,8 +75,10 @@ function setMode(m) {
   mode = m;
   body.dataset.mode = m;
   if (m !== 'flash' && m !== 'capturing') output.black();
-  if (m === 'perform') { clearTimeout(toastTimer); $('#msg').classList.remove('show'); }
+  if (PROJECTING.has(m)) { clearTimeout(toastTimer); $('#msg').classList.remove('show'); }
   if (prev === 'perform' && m !== 'perform') performer.stop({ quiet: true });
+  if (prev === 'segments' && m !== 'segments') { segPerformer.stop({ quiet: true }); seglight.off(); }
+  if (prev === 'segshow' && m !== 'segshow') seglight.off();
   if ((prev === 'light' || prev === 'perform') && m !== prev) light.off();
   if (m !== 'paintings') { edit.draft = []; edit.drag = null; edit.selected = null; }
   renderToolbar();
@@ -76,9 +89,12 @@ function setMode(m) {
 
 // ------------------------------------------------------------------ helpers
 
+// Modes where the screen is the artwork: nothing else is ever drawn on it.
+const PROJECTING = new Set(['perform', 'segments']);
+
 let toastTimer = 0;
 function toast(text, ms = 2800) {
-  if (mode === 'perform') return; // nothing is ever written on the wall during a performance
+  if (PROJECTING.has(mode)) return; // nothing is ever written on the wall during a performance
   const el = $('#msg');
   el.textContent = text;
   el.classList.add('show');
@@ -253,6 +269,15 @@ function renderLinks() {
 function renderPerfStatus(s = { state: performer.state, ...(performer.now || {}) }) {
   const el = $('#perfStatus');
   if (!el) return;
+  const kind = settings.perform.kind;
+  $('#segControls').hidden = kind !== 'segments';
+  $('#gazeControls').hidden = kind !== 'gaze';
+  if (segPerformer.running) {
+    const p = segPerformer.state === 'paused';
+    el.textContent = `${p ? 'Paused · ' : ''}Composition ${segPerformer.count}${segPerformer.current?.at ? ' (saved)' : ''}.`;
+    $('#pauseBtn').textContent = p ? 'Resume' : 'Pause';
+    return;
+  }
   if (s.state === 'stopped') el.textContent = 'Not playing.';
   else if (s.between) el.textContent = `${s.state === 'paused' ? 'Paused · ' : ''}Dark pause between readings.`;
   else if (s.title) el.textContent = `${s.state === 'paused' ? 'Paused · ' : ''}“${s.title}”, stop ${s.stop} of ${s.total}.`;
@@ -278,6 +303,85 @@ async function startPerformance() {
   camera.stop(); // not needed while performing; saves battery and heat
   renderCamInfo();
   performer.start(playable);
+}
+
+// ------------------------------------------------------------------ segments
+
+// Cut one painting's image into segments (in the vision worker) and keep them.
+async function findSegments(p) {
+  if (!(await visionReady())) return null;
+  const img = await paintings.imageData(p, 500);
+  if (!img) return null;
+  const r = await vision.withFrame('segment', img, SEG_PARAMS);
+  await paintings.saveSegments(p, { w: r.w, h: r.h, n: r.n, ids: new Uint16Array(r.ids) }, SEG_PARAMS);
+  return paintings.loadSegments(p);
+}
+
+// Every painting with an image, with its segments (found now if missing),
+// mapped onto the phone screen through the calibration.
+async function prepareSegments() {
+  if (!calib?.Hinv) { toast('Calibrate first, so the colours can find the paintings.', 4000); return null; }
+  const withImage = paintings.list.filter((p) => p.image);
+  if (!withImage.length) { toast('Capture the paintings first: Paintings → Capture images.', 5000); return null; }
+  const entries = [];
+  for (const p of withImage) {
+    let seg = await paintings.loadSegments(p);
+    if (!seg) {
+      toast(`Finding the segments of ${p.name}…`, 30000);
+      seg = await findSegments(p);
+    }
+    if (seg) entries.push({ pid: p.id, seg, Pinv: invertH(paintings.toCamera(p)) });
+  }
+  $('#msg').classList.remove('show');
+  if (!entries.length) { toast('Could not find segments. Try Capture images again.', 5000); return null; }
+  seglight.buildMap(entries, calib.Hinv, output.w, output.h);
+  const segAt = Object.fromEntries(entries.map((e) => [e.pid, e.seg.at]));
+  segState = { entries, segAt };
+  return segState;
+}
+
+function compositionPixels(comp) {
+  return seglight.pixelsFor(comp, { neutral: settings.seg.neutral, strength: settings.seg.strength, neutralColor: settings.light.color });
+}
+
+let savedCursor = 0;
+function nextComposition() {
+  if (!segState) return null;
+  const saved = usableSaved(segState.segAt);
+  const src = settings.seg.source;
+  let comp = null;
+  if (saved.length && (src === 'saved' || (src === 'mix' && Math.random() < 0.35))) {
+    comp = saved[savedCursor++ % saved.length];
+  } else {
+    comp = generate(segState.entries.map((e) => ({ pid: e.pid, seg: e.seg })), { cover: settings.seg.cover });
+  }
+  return { comp, pixels: compositionPixels(comp) };
+}
+
+async function startSegments() {
+  closePanel();
+  const ok = await prepareSegments();
+  if (!ok) return;
+  setMode('segments');
+  camera.stop();
+  renderCamInfo();
+  segPerformer.start();
+}
+
+// Project the segment outlines onto the paintings, to check how they sit.
+async function showSegments() {
+  closePanel();
+  const ok = await prepareSegments();
+  if (!ok) return;
+  setMode('segshow');
+  seglight.show(seglight.outlinePixels(), 0.6);
+}
+
+function renderSegStatus(msg = '') {
+  const el = $('#segStatus');
+  if (!el) return;
+  const n = segState ? usableSaved(segState.segAt).length : savedCompositions().length;
+  el.textContent = (msg ? msg + ' ' : '') + `${n} saved composition(s).`;
 }
 
 async function ensureCamera() {
@@ -407,7 +511,14 @@ async function renderPaintList() {
   el.innerHTML = items.map(({ p, url }) => `
     <div class="item">
       ${url ? `<img src="${url}" alt="">` : '<img alt="">'}
-      <div class="grow"><div>${esc(p.name)}</div><div class="muted small">${!p.image ? 'no image yet' : p.image.stale ? 'corners changed: capture again' : `${p.image.w} × ${p.image.h}`}</div></div>
+      <div class="grow">
+        <div>${esc(p.name)}</div>
+        <div class="muted small">${!p.image ? 'no image yet' : p.image.stale ? 'corners changed: capture again' : `${p.image.source === 'photo' ? 'your photo' : 'camera'} ${p.image.w} × ${p.image.h}`}${p.seg ? ` · ${p.seg.n} segments` : ''}</div>
+        <div class="segs">
+          <button data-findseg="${esc(p.id)}" ${p.image ? '' : 'disabled'}>${p.seg ? 'Find segments again' : 'Find segments'}</button>
+          <button data-photo="${esc(p.id)}">Use my photo</button>
+        </div>
+      </div>
       <button data-del="${esc(p.id)}">Delete</button>
     </div>`).join('');
 }
@@ -786,11 +897,40 @@ $('#review').addEventListener('change', (e) => {
   if (id) { paintings.rename(id, e.target.value); renderPaintList(); }
 });
 
-$('#paintList').addEventListener('click', (e) => {
-  const id = e.target?.dataset?.del;
-  if (!id) return;
-  const p = paintings.get(id);
-  if (p && confirm(`Delete ${p.name}?`)) { paintings.remove(id); renderPaintList(); drawOverlay(); renderStatus(); }
+let photoFor = null;
+$('#paintList').addEventListener('click', async (e) => {
+  const d = e.target?.dataset || {};
+  if (d.del) {
+    const p = paintings.get(d.del);
+    if (p && confirm(`Delete ${p.name}?`)) { paintings.remove(d.del); renderPaintList(); drawOverlay(); renderStatus(); }
+  } else if (d.findseg) {
+    const p = paintings.get(d.findseg);
+    if (!p) return;
+    e.target.disabled = true;
+    e.target.textContent = 'Finding…';
+    const seg = await findSegments(p);
+    segState = null;
+    renderPaintList();
+    renderSegStatus(seg ? `${p.name}: ${seg.n} segments.` : 'Could not find segments.');
+  } else if (d.photo) {
+    photoFor = d.photo;
+    $('#photoInput').click();
+  }
+});
+$('#photoInput').addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  const p = photoFor && paintings.get(photoFor);
+  e.target.value = '';
+  if (!file || !p) return;
+  try {
+    await paintings.setPhoto(p, file);
+    const seg = await findSegments(p);
+    segState = null;
+    renderPaintList();
+    renderSegStatus(seg ? `${p.name}: your photo, ${seg.n} segments.` : '');
+  } catch (err) {
+    toast('Could not use that photo: ' + err.message, 5000);
+  }
 });
 
 // ------------------------------------------------------------------ test light
@@ -905,6 +1045,11 @@ overlay.addEventListener('pointercancel', (e) => {
   test.down = null;
 });
 
+// Tap the projected segment outlines to go back.
+$('#seg').addEventListener('pointerup', () => {
+  if (mode === 'segshow') { setMode('camera'); ensureCamera(); }
+});
+
 $('#out').addEventListener('pointerdown', () => {
   if (mode === 'calibrating') abortCal?.abort();
   else if (mode === 'flash') { clearTimeout(flashTimer); setMode(flashBack); }
@@ -915,7 +1060,7 @@ $('#out').addEventListener('pointerdown', () => {
 function openPanel() {
   $('#panel').hidden = false;
   autoLink();
-  renderStatus(); renderCamInfo(); renderPaintList(); renderLinks(); renderPerfStatus(); fillVoices();
+  renderStatus(); renderCamInfo(); renderPaintList(); renderLinks(); renderPerfStatus(); fillVoices(); renderSegStatus();
 }
 function closePanel() { $('#panel').hidden = true; }
 $('#hotspot').addEventListener('click', () => ($('#panel').hidden ? openPanel() : closePanel()));
@@ -926,11 +1071,28 @@ const actions = {
   black: () => { closePanel(); setMode('black'); toast('Tap the top-right corner for the menu.', 2000); },
   paintings: () => { closePanel(); setMode('paintings'); ensureCamera(); },
   testlight: () => { closePanel(); setMode('testlight'); ensureCamera(); },
-  perform: startPerformance,
-  pause: () => { if (performer.state === 'paused') performer.resume(); else performer.pause(); },
+  perform: () => (settings.perform.kind === 'gaze' ? startPerformance() : startSegments()),
+  pause: () => {
+    const p = segPerformer.running ? segPerformer : performer;
+    if (p.state === 'paused') p.resume(); else p.pause();
+  },
+  next: () => (segPerformer.running ? segPerformer.next() : performer.nextStop()),
   nextstop: () => performer.nextStop(),
   nextreading: () => performer.nextReading(),
-  stopperform: () => { performer.stop(); closePanel(); setTimeout(() => { if (mode === 'perform') { setMode('camera'); ensureCamera(); } }, 1600); },
+  stopperform: () => {
+    const wasSeg = segPerformer.running;
+    performer.stop();
+    segPerformer.stop();
+    closePanel();
+    setTimeout(() => { if (PROJECTING.has(mode)) { setMode('camera'); ensureCamera(); } }, wasSeg ? 300 : 1600);
+  },
+  savecomp: () => {
+    if (!segPerformer.running || !segPerformer.current || !segState) { renderSegStatus('Start a Segments performance first.'); return; }
+    saveComposition(segPerformer.current, segState.segAt);
+    renderSegStatus('Saved ♥.');
+  },
+  clearcomps: () => { if (confirm('Delete all saved compositions?')) { clearCompositions(); renderSegStatus('Cleared.'); } },
+  showsegs: showSegments,
   reloadreadings: () => loadReadings().then(() => toast(`${readingsData.readings.length} readings loaded.`)),
   capture: () => captureImages(),
   'capture-white': () => { settings.captureLight = 'white'; saveSettings(); $('#setCapLight').value = 'white'; captureImages('white'); },
@@ -995,7 +1157,36 @@ function fillVoices() {
 voice.onvoices = () => fillVoices();
 
 function bindSettings() {
-  // Performance
+  // What to perform
+  const kind = $('#setKind');
+  kind.value = settings.perform.kind;
+  kind.addEventListener('change', () => { settings.perform.kind = kind.value; saveSettings(); renderPerfStatus(); });
+  const speak = $('#setSpeak');
+  speak.checked = !!settings.perform.speak;
+  speak.addEventListener('change', () => { settings.perform.speak = speak.checked; saveSettings(); });
+
+  // Segments
+  const SEG_FMT = {
+    hold: (v) => `${Math.round(v)} s`, fade: (v) => `${(+v).toFixed(1)} s`,
+    cover: (v) => `${Math.round(v * 100)}%`, neutral: (v) => `${Math.round(v * 100)}%`, strength: (v) => `${Math.round(v * 100)}%`,
+  };
+  for (const el of document.querySelectorAll('[data-seg]')) {
+    const k = el.dataset.seg;
+    const out = () => { $(`#o-${k}`).textContent = SEG_FMT[k](settings.seg[k]); };
+    el.value = settings.seg[k];
+    out();
+    el.addEventListener('input', () => { settings.seg[k] = +el.value; out(); saveSettings(); });
+    // Brightness changes show at once on the current composition.
+    if (k === 'neutral' || k === 'strength') {
+      el.addEventListener('change', () => { if (segPerformer.running && segPerformer.current) seglight.show(compositionPixels(segPerformer.current), 0.4); });
+    }
+  }
+  const srcSel = $('#setSource');
+  srcSel.value = settings.seg.source;
+  srcSel.addEventListener('change', () => { settings.seg.source = srcSel.value; saveSettings(); });
+  renderSegStatus();
+
+  // Gaze
   const mv = $('#setMovement');
   mv.value = settings.perform.movement;
   mv.addEventListener('change', () => { settings.perform.movement = mv.value; saveSettings(); });
@@ -1146,6 +1337,8 @@ window.gaze = {
   get mode() { return mode; },
   get visionState() { return visionState; },
   get readings() { return readingsData; },
+  get segState() { return segState; },
+  seglight, segPerformer,
   runCalibration, setMode, captureImages, cameraRegionToScreen, showLight,
-  startPerformance, paintingStopToScreen, loadReadings,
+  startPerformance, paintingStopToScreen, loadReadings, startSegments, showSegments, findSegments,
 };

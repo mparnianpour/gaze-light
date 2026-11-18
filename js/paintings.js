@@ -39,7 +39,9 @@ export class Paintings {
     const url = this.urls.get(id);
     if (url) URL.revokeObjectURL(url);
     this.urls.delete(id);
+    this.segCache?.delete(id);
     deleteImage(id).catch(() => {});
+    deleteImage(`${id}:seg`).catch(() => {});
   }
 
   rename(id, name) {
@@ -72,18 +74,88 @@ export class Paintings {
   }
 
   // Store a flattened image ({ width, height, buffer }) as JPEG.
-  async setImage(p, img) {
+  async setImage(p, img, source = 'camera') {
     const c = document.createElement('canvas');
     c.width = img.width;
     c.height = img.height;
     c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(img.buffer), img.width, img.height), 0, 0);
     const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.92));
+    await this.storeImage(p, blob, img.width, img.height, source);
+  }
+
+  async storeImage(p, blob, w, h, source) {
     await putImage(p.id, blob);
-    p.image = { w: img.width, h: img.height, at: Date.now(), bytes: blob.size };
+    p.image = { w, h, at: Date.now(), bytes: blob.size, source };
     const old = this.urls.get(p.id);
     if (old) URL.revokeObjectURL(old);
     this.urls.set(p.id, URL.createObjectURL(blob));
+    // A new image means new segments.
+    p.seg = null;
+    this.segCache?.delete(p.id);
+    deleteImage(`${p.id}:seg`).catch(() => {});
     this.save();
+  }
+
+  // Your own photo of the painting, cropped to the canvas edges. It is
+  // stretched to the painting's proportions as seen through its corners.
+  async setPhoto(p, file) {
+    const bmp = await createImageBitmap(file);
+    const [fw, fh] = this.flatSize(p, 1920, 1080);
+    const aspect = fw / fh;
+    let w = Math.min(MAX_SIDE, bmp.width);
+    let h = Math.round(w / aspect);
+    if (h > MAX_SIDE) { h = MAX_SIDE; w = Math.round(h * aspect); }
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    c.getContext('2d').drawImage(bmp, 0, 0, w, h);
+    bmp.close?.();
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.92));
+    await this.storeImage(p, blob, w, h, 'photo');
+  }
+
+  // The painting's image as ImageData, at most `maxSide` pixels on its long side.
+  async imageData(p, maxSide = 500) {
+    const blob = await this.imageBlob(p);
+    if (!blob) return null;
+    const bmp = await createImageBitmap(blob);
+    const s = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
+    const w = Math.round(bmp.width * s), h = Math.round(bmp.height * s);
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.drawImage(bmp, 0, 0, w, h);
+    bmp.close?.();
+    return g.getImageData(0, 0, w, h);
+  }
+
+  // ---- segments ----
+
+  async saveSegments(p, seg, params) {
+    await putImage(`${p.id}:seg`, new Blob([seg.ids.buffer]));
+    p.seg = { w: seg.w, h: seg.h, n: seg.n, at: Date.now(), params };
+    this.segCache = this.segCache || new Map();
+    this.segCache.set(p.id, { ...seg, at: p.seg.at });
+    this.save();
+  }
+
+  async loadSegments(p) {
+    if (!p.seg) return null;
+    this.segCache = this.segCache || new Map();
+    const hit = this.segCache.get(p.id);
+    if (hit && hit.at === p.seg.at) return hit;
+    try {
+      const blob = await getImage(`${p.id}:seg`);
+      if (!blob) return null;
+      const ids = new Uint16Array(await blob.arrayBuffer());
+      if (ids.length !== p.seg.w * p.seg.h) return null;
+      const seg = { w: p.seg.w, h: p.seg.h, n: p.seg.n, ids, at: p.seg.at };
+      this.segCache.set(p.id, seg);
+      return seg;
+    } catch {
+      return null;
+    }
   }
 
   async imageURL(p) {

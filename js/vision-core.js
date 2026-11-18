@@ -148,6 +148,61 @@
         return out;
       },
 
+      // Cut a flattened painting into segments that follow its own shapes and
+      // colour areas: smooth the texture (keeping edges), group colours
+      // (k-means in Lab), split into connected regions, and fold regions that
+      // are too small into the neighbour they share the most border with.
+      // → { w, h, n, ids: Uint16Array (segment per pixel) }
+      segment({ frame, k = 9, passes = 2, minFrac = 0.0012 }) {
+        const W = frame.width, H = frame.height, N = W * H;
+        const rgba = cv.matFromImageData({ data: new Uint8ClampedArray(frame.buffer, 0, N * 4), width: W, height: H });
+        let rgb = new cv.Mat();
+        cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);
+        for (let i = 0; i < passes; i++) { const t = new cv.Mat(); cv.bilateralFilter(rgb, t, 9, 40, 7); rgb.delete(); rgb = t; }
+        const lab = new cv.Mat();
+        cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
+        const samples = new cv.Mat(N, 3, cv.CV_32F);
+        for (let i = 0; i < N * 3; i++) samples.data32F[i] = lab.data[i];
+        const labels = new cv.Mat(), centers = new cv.Mat();
+        const crit = new cv.TermCriteria(cv.TermCriteria_EPS + cv.TermCriteria_MAX_ITER, 20, 0.5);
+        cv.kmeans(samples, k, labels, crit, 2, cv.KMEANS_PP_CENTERS, centers);
+        const cl = new cv.Mat(H, W, cv.CV_8UC1);
+        for (let i = 0; i < N; i++) cl.data[i] = labels.data32S[i];
+        const clm = new cv.Mat();
+        cv.medianBlur(cl, clm, 5);
+        const ids = new Int32Array(N).fill(-1);
+        let n = 0;
+        const mask = new cv.Mat(H, W, cv.CV_8UC1), cc = new cv.Mat(), st = new cv.Mat(), ce = new cv.Mat();
+        for (let c = 0; c < k; c++) {
+          for (let i = 0; i < N; i++) mask.data[i] = clm.data[i] === c ? 255 : 0;
+          const count = cv.connectedComponentsWithStats(mask, cc, st, ce, 4, cv.CV_32S);
+          for (let i = 0; i < N; i++) { const l = cc.data32S[i]; if (l > 0) ids[i] = n + l - 1; }
+          n += count - 1;
+        }
+        [rgba, rgb, lab, samples, labels, centers, cl, clm, mask, cc, st, ce].forEach((m) => m.delete());
+        const minArea = Math.round(N * minFrac);
+        for (let round = 0; round < 12; round++) {
+          const area = new Int32Array(n);
+          for (let i = 0; i < N; i++) area[ids[i]]++;
+          const border = new Map();
+          const add = (a, b) => { if (area[a] >= minArea) return; let m = border.get(a); if (!m) border.set(a, (m = new Map())); m.set(b, (m.get(b) || 0) + 1); };
+          for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+            const i = y * W + x, a = ids[i];
+            if (x + 1 < W && ids[i + 1] !== a) { add(a, ids[i + 1]); add(ids[i + 1], a); }
+            if (y + 1 < H && ids[i + W] !== a) { add(a, ids[i + W]); add(ids[i + W], a); }
+          }
+          if (!border.size) break;
+          const to = new Int32Array(n).map((_, i) => i);
+          for (const [a, m] of border) { let best = -1, bc = -1; for (const [b, c] of m) if (c > bc) { bc = c; best = b; } if (best >= 0) to[a] = best; }
+          const root = (a) => { let s = 0; while (to[a] !== a && s++ < 50) a = to[a]; return a; };
+          for (let i = 0; i < N; i++) ids[i] = root(ids[i]);
+        }
+        const remap = new Map();
+        const out = new Uint16Array(N);
+        for (let i = 0; i < N; i++) { let v = remap.get(ids[i]); if (v == null) { v = remap.size; remap.set(ids[i], v); } out[i] = v; }
+        return { w: W, h: H, n: remap.size, ids: out };
+      },
+
       // Homography from src points to dst points: RANSAC to drop outliers,
       // then a least-squares refit on the inliers.
       fit({ src, dst, ransac }) {

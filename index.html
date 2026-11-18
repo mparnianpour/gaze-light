@@ -14,6 +14,8 @@
   <canvas id="out"></canvas>
   <!-- The soft light (WebGL), shown on black. -->
   <canvas id="light"></canvas>
+  <!-- Segment compositions (WebGL). -->
+  <canvas id="seg"></canvas>
   <!-- Live camera view (setup only). -->
   <video id="cam" playsinline muted autoplay></video>
   <!-- Markings drawn over the camera view. -->
@@ -44,14 +46,53 @@
 
     <section>
       <h3>Performance</h3>
-      <div class="row">
+      <label>What to perform
+        <select id="setKind">
+          <option value="segments">Segments: colour compositions</option>
+          <option value="gaze">Gaze: soft light following the readings</option>
+        </select>
+      </label>
+      <div class="row" style="margin-top:10px">
         <button data-act="perform" class="primary">Perform</button>
         <button data-act="pause" id="pauseBtn">Pause</button>
-        <button data-act="nextstop">Next stop</button>
-        <button data-act="nextreading">Next reading</button>
+        <button data-act="next">Next</button>
         <button data-act="stopperform">Stop</button>
       </div>
       <p id="perfStatus" class="muted small"></p>
+
+      <div id="segControls">
+        <div class="row" style="margin-top:8px">
+          <button data-act="savecomp">♥ Save this composition</button>
+          <button data-act="clearcomps">Clear saved</button>
+        </div>
+        <p id="segStatus" class="muted small"></p>
+        <label>Compositions
+          <select id="setSource">
+            <option value="mix">New and saved</option>
+            <option value="saved">Only saved</option>
+            <option value="new">Only new</option>
+          </select>
+        </label>
+        <label>Hold each <span id="o-hold" class="muted"></span>
+          <input type="range" data-seg="hold" min="3" max="120" step="1">
+        </label>
+        <label>Crossfade <span id="o-fade" class="muted"></span>
+          <input type="range" data-seg="fade" min="0.5" max="30" step="0.5">
+        </label>
+        <label>Colour coverage <span id="o-cover" class="muted"></span>
+          <input type="range" data-seg="cover" min="0.1" max="0.9" step="0.05">
+        </label>
+        <label>Light on the rest of the painting <span id="o-neutral" class="muted"></span>
+          <input type="range" data-seg="neutral" min="0" max="1" step="0.05">
+        </label>
+        <label>Colour brightness <span id="o-strength" class="muted"></span>
+          <input type="range" data-seg="strength" min="0.2" max="1" step="0.05">
+        </label>
+      </div>
+
+      <div id="gazeControls">
+      <label class="check"><input type="checkbox" id="setSpeak"> Speak the readings</label>
+      <div class="row" style="margin-top:8px"><button data-act="nextreading">Next reading</button></div>
       <label>Movement
         <select id="setMovement">
           <option value="dissolve">Dissolve: fade here, bloom there</option>
@@ -66,6 +107,7 @@
       <p id="readingsInfo" class="muted small"></p>
       <div id="links"></div>
       <div class="row" style="margin-top:8px"><button data-act="reloadreadings">Reload readings</button></div>
+      </div>
     </section>
 
     <section>
@@ -94,8 +136,10 @@
       <div class="row">
         <button data-act="paintings">Edit corners</button>
         <button data-act="capture">Capture images</button>
+        <button data-act="showsegs">Show segments</button>
       </div>
       <div id="paintList"></div>
+      <input type="file" id="photoInput" accept="image/*" hidden>
       <label>Light while capturing
         <select id="setCapLight">
           <option value="black">Room light (projector black)</option>

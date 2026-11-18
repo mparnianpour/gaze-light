@@ -134,7 +134,7 @@ export class Performer {
         const arrive = move === 'glide' ? 0.85 * T : 0.45 * T;
         if (!(await this.wait(arrive, token))) { if (this.skip === 'stop') continue; if (this.skip === 'reading') break; return; }
         const t0 = performance.now();
-        await this.say(stop.say, token);
+        if (this.settings.speak) await this.say(stop.say, token);
         if (token !== this.token) return;
         if (this.skip === 'stop') continue;
         if (this.skip === 'reading') break;
@@ -154,6 +154,67 @@ export class Performer {
       this.status();
       await this.wait(2.5 + (this.settings.pauseBetween ?? 4), token);
       this.skip = null;
+    }
+  }
+}
+
+// Segments: one composition after another, each crossfading into the next.
+// makeNext() → { comp, pixels } ; settings: { hold, fade }
+export class SegmentPerformer {
+  constructor({ seglight, makeNext, settings, onStatus }) {
+    Object.assign(this, { seglight, makeNext, settings, onStatus });
+    this.state = 'stopped';
+    this.token = null;
+    this.current = null;
+    this.count = 0;
+    this.skip = false;
+  }
+
+  get running() { return this.state !== 'stopped'; }
+
+  start() {
+    this.stop({ quiet: true });
+    this.state = 'playing';
+    this.count = 0;
+    const token = (this.token = {});
+    this.loop(token).catch((e) => { console.error(e); this.stop(); });
+    this.status();
+  }
+
+  stop({ quiet = false } = {}) {
+    this.state = 'stopped';
+    this.token = null;
+    if (!quiet) this.seglight.off();
+    this.status();
+  }
+
+  pause() { if (this.state === 'playing') { this.state = 'paused'; this.status(); } }
+  resume() { if (this.state === 'paused') { this.state = 'playing'; this.status(); } }
+  next() { if (this.running) this.skip = true; }
+
+  status() { this.onStatus?.({ state: this.state, count: this.count, current: this.current }); }
+
+  async wait(seconds, token) {
+    let left = seconds * 1000;
+    while (left > 0) {
+      if (token !== this.token || this.skip) return;
+      const step = Math.min(100, left);
+      await sleep(step);
+      if (this.state === 'playing') left -= step;
+    }
+  }
+
+  async loop(token) {
+    while (token === this.token) {
+      this.skip = false;
+      const next = this.makeNext();
+      if (!next) { this.stop(); return; }
+      this.current = next.comp;
+      this.count++;
+      this.status();
+      const fade = this.settings.fade * (0.9 + Math.random() * 0.2);
+      this.seglight.show(next.pixels, fade);
+      await this.wait(fade + this.settings.hold * (0.9 + Math.random() * 0.2), token);
     }
   }
 }
