@@ -13,7 +13,7 @@ GitHub Pages so Chrome gets HTTPS (needed for the camera).
 
 - [x] **Milestone 1** — camera, black fullscreen output, calibration with visible confirmation
 - [x] **Milestone 2** — tap painting corners, flatten and save them, soft-brush test light
-- [ ] Milestone 3 — Claude reading, moving light, spoken narration
+- [x] **Milestone 3** — readings played on the wall: moving light and spoken narration (readings written ahead of time; no API needed)
 - [ ] Milestone 4 — polish, settings, saving and loading
 
 ## Using milestone 1
@@ -45,6 +45,20 @@ The menu is behind the **top-right corner** (☰ in the camera view, invisible o
 4. Light settings in the menu: brightness, size, softness, falloff distance, transition, colour.
 
 Paintings, corners and images are saved on the phone and survive a reload.
+
+## Using milestone 3
+
+1. Calibrate and mark the painting's corners (milestones 1 and 2).
+2. Menu → **Performance → Readings**: each painting named in the readings is linked to
+   a painting you marked on the phone (automatic when there is one of each).
+3. Tap **Perform**. The screen goes black; the light moves from stop to stop and the
+   phone speaks each stop as the light arrives. Nothing is written on the wall.
+   Readings play in shuffled order with a dark pause between them.
+4. Menu: pause / resume, next stop, next reading, stop; movement (dissolve, glide, or
+   glide near and dissolve far); length of the dark pause; voice, speed and pitch.
+
+The camera is switched off during the performance to save battery. Readings are cached on
+the phone, so a performance can start even if the network drops.
 
 The calibration is saved on the phone. It stays valid as long as the phone, tripod and
 projector don't move and the page is fullscreen.

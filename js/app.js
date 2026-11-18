@@ -6,17 +6,26 @@ import { calibrate } from './calibrate.js';
 import { applyH, pointInQuad } from './geometry.js';
 import { Light, LIGHT_DEFAULTS } from './light.js';
 import { Paintings } from './paintings.js';
+import { Voice } from './speech.js';
+import { Performer } from './perform.js';
 
-const VERSION = 'Milestone 2';
+const VERSION = 'Milestone 3';
 const KEY_SETTINGS = 'gaze.settings';
 const KEY_CALIB = 'gaze.calibration';
+const KEY_READINGS = 'gaze.readings';
+const VOICE_DEFAULTS = { voiceURI: null, rate: 0.95, pitch: 1, lang: 'en-US' };
+const PERFORM_DEFAULTS = { movement: 'dissolve', pauseBetween: 4 };
 const DEFAULTS = {
   v: 3, deviceId: null, camHeight: 1080, grid: '5x4', dotSize: 4, previewDim: 0.6,
   captureLight: 'black', light: { ...LIGHT_DEFAULTS },
+  voice: { ...VOICE_DEFAULTS }, perform: { ...PERFORM_DEFAULTS }, links: {},
 };
 
 const settings = { ...DEFAULTS, ...load(KEY_SETTINGS, {}) };
 settings.light = { ...LIGHT_DEFAULTS, ...(settings.light || {}) };
+settings.voice = { ...VOICE_DEFAULTS, ...(settings.voice || {}) };
+settings.perform = { ...PERFORM_DEFAULTS, ...(settings.perform || {}) };
+settings.links = { ...(settings.links || {}) };
 if ((settings.v || 1) < 2 && settings.dotSize === 2.5) settings.dotSize = DEFAULTS.dotSize; // old smaller default
 settings.v = DEFAULTS.v;
 const saveSettings = () => save(KEY_SETTINGS, settings);
@@ -28,6 +37,13 @@ const camera = new Camera($('#cam'));
 const light = new Light($('#light'));
 light.setParams(settings.light);
 const paintings = new Paintings();
+const voice = new Voice(settings.voice);
+let readingsData = load(KEY_READINGS, null) || { files: [], paintings: [], readings: [] };
+const performer = new Performer({
+  light, voice, settings: settings.perform,
+  regionFor: (stop) => paintingStopToScreen(stop),
+  onStatus: (s) => renderPerfStatus(s),
+});
 
 // OpenCV.js runs in a background worker so its large download and start-up
 // never freeze the page.
@@ -48,7 +64,9 @@ function setMode(m) {
   mode = m;
   body.dataset.mode = m;
   if (m !== 'flash' && m !== 'capturing') output.black();
-  if (prev === 'light' && m !== 'light') light.off();
+  if (m === 'perform') { clearTimeout(toastTimer); $('#msg').classList.remove('show'); }
+  if (prev === 'perform' && m !== 'perform') performer.stop({ quiet: true });
+  if ((prev === 'light' || prev === 'perform') && m !== prev) light.off();
   if (m !== 'paintings') { edit.draft = []; edit.drag = null; edit.selected = null; }
   renderToolbar();
   renderStatus();
@@ -60,6 +78,7 @@ function setMode(m) {
 
 let toastTimer = 0;
 function toast(text, ms = 2800) {
+  if (mode === 'perform') return; // nothing is ever written on the wall during a performance
   const el = $('#msg');
   el.textContent = text;
   el.classList.add('show');
@@ -68,13 +87,7 @@ function toast(text, ms = 2800) {
 }
 
 function speak(text) {
-  if (!('speechSynthesis' in window)) return;
-  try {
-    speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = 'en-US';
-    speechSynthesis.speak(u);
-  } catch { /* no voice available */ }
+  voice.speak(text);
 }
 
 function isFullscreen() {
@@ -157,10 +170,125 @@ function cameraRegionToScreen(u, v, rv) {
   return { center: s0, ax: [s1[0] - s0[0], s1[1] - s0[1]], ay: [s2[0] - s0[0], s2[1] - s0[1]] };
 }
 
+// A stop of a reading (painting coordinates) → an ellipse on the phone screen:
+// painting → camera through the painting's corners, camera → screen through
+// the calibration.
+function paintingAspect(key, p) {
+  const rp = readingsData.paintings.find((q) => q.key === key);
+  if (rp?.aspect) return rp.aspect;
+  if (p.image?.w) return p.image.w / p.image.h;
+  const [w, h] = paintings.flatSize(p, camera.width || 1920, camera.height || 1080);
+  return w / h;
+}
+
+function linkedPainting(key) {
+  const id = settings.links[key];
+  return id ? paintings.get(id) : null;
+}
+
+function paintingStopToScreen(stop) {
+  const p = linkedPainting(stop.painting);
+  if (!p || !calib?.H) return null;
+  const P = paintings.toCamera(p);
+  const A = paintingAspect(stop.painting, p);
+  const toScreen = (x, y) => { const [u, v] = applyH(P, x, y); return applyH(calib.H, u, v); };
+  const a = ((stop.angle || 0) * Math.PI) / 180;
+  // A little randomness, so a reading never lands exactly the same way twice.
+  const cx = stop.x + (Math.random() - 0.5) * 0.04 * stop.w;
+  const cy = stop.y + (Math.random() - 0.5) * 0.04 * stop.h;
+  const c = toScreen(cx, cy);
+  const e1 = toScreen(cx + (Math.cos(a) * stop.w) / 2, cy + (Math.sin(a) * stop.w * A) / 2);
+  const e2 = toScreen(cx - (Math.sin(a) * stop.h) / (2 * A), cy + (Math.cos(a) * stop.h) / 2);
+  return { center: c, ax: [e1[0] - c[0], e1[1] - c[1]], ay: [e2[0] - c[0], e2[1] - c[1]] };
+}
+
+// ------------------------------------------------------------------ readings
+
+async function loadReadings() {
+  try {
+    const idx = await (await fetch('readings/index.json', { cache: 'no-cache' })).json();
+    const all = { files: idx.files || [], paintings: [], readings: [] };
+    for (const f of all.files) {
+      const j = await (await fetch(`readings/${f}`, { cache: 'no-cache' })).json();
+      all.paintings.push(...(j.paintings || []));
+      all.readings.push(...(j.readings || []));
+    }
+    readingsData = all;
+    save(KEY_READINGS, all); // kept on the phone in case the network is down at the show
+  } catch (e) {
+    console.warn('Readings not loaded, using the saved copy', e);
+  }
+  autoLink();
+  renderLinks();
+  renderPerfStatus();
+  startNote();
+}
+
+// Link each painting named in the readings to one of the phone's paintings:
+// by name, or automatically when there is only one of each.
+function autoLink() {
+  let changed = false;
+  for (const rp of readingsData.paintings) {
+    if (linkedPainting(rp.key)) continue;
+    const byName = paintings.list.find((p) => p.name.trim().toLowerCase() === String(rp.title || rp.key).toLowerCase());
+    const only = paintings.list.length === 1 && readingsData.paintings.length === 1 ? paintings.list[0] : null;
+    const pick = byName || only;
+    if (pick) { settings.links[rp.key] = pick.id; changed = true; }
+  }
+  if (changed) saveSettings();
+}
+
+function renderLinks() {
+  $('#readingsInfo').textContent = readingsData.readings.length
+    ? `${readingsData.readings.length} readings loaded (${readingsData.files.join(', ')}). Link each painting below to one you marked on this phone.`
+    : 'No readings loaded.';
+  $('#links').innerHTML = readingsData.paintings.map((rp) => `
+    <div class="link"><span>${esc(rp.title || rp.key)} →</span>
+      <select data-link="${esc(rp.key)}">
+        <option value="">(not linked)</option>
+        ${paintings.list.map((p) => `<option value="${esc(p.id)}" ${settings.links[rp.key] === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}
+      </select></div>`).join('');
+}
+
+function renderPerfStatus(s = { state: performer.state, ...(performer.now || {}) }) {
+  const el = $('#perfStatus');
+  if (!el) return;
+  if (s.state === 'stopped') el.textContent = 'Not playing.';
+  else if (s.between) el.textContent = `${s.state === 'paused' ? 'Paused · ' : ''}Dark pause between readings.`;
+  else if (s.title) el.textContent = `${s.state === 'paused' ? 'Paused · ' : ''}“${s.title}”, stop ${s.stop} of ${s.total}.`;
+  else el.textContent = s.state === 'paused' ? 'Paused.' : 'Playing.';
+  $('#pauseBtn').textContent = s.state === 'paused' ? 'Resume' : 'Pause';
+}
+
+async function startPerformance() {
+  closePanel();
+  if (!calib?.H) { toast('Calibrate first, so the light can find the wall.', 4000); return; }
+  autoLink();
+  const playable = readingsData.readings
+    .map((r) => ({ ...r, stops: r.stops.filter((s) => linkedPainting(s.painting)) }))
+    .filter((r) => r.stops.length >= 3);
+  if (!playable.length) {
+    toast(readingsData.readings.length
+      ? 'Link the readings to a painting first: menu → Performance → Readings.'
+      : 'No readings are loaded yet.', 5000);
+    openPanel();
+    return;
+  }
+  setMode('perform');
+  camera.stop(); // not needed while performing; saves battery and heat
+  renderCamInfo();
+  performer.start(playable);
+}
+
+async function ensureCamera() {
+  if (camera.running) return true;
+  try { await startCamera(); return true; } catch (e) { toast(cameraErrorText(e), 6000); return false; }
+}
+
 // ------------------------------------------------------------------ rendering
 
 const TOOLS = {
-  camera: [['calibrate', 'Calibrate', 'primary'], ['paintings', 'Paintings'], ['testlight', 'Test light'], ['black', 'Black screen']],
+  camera: [['perform', 'Perform', 'primary'], ['calibrate', 'Calibrate'], ['paintings', 'Paintings'], ['testlight', 'Test light'], ['black', 'Black screen']],
   paintings: [['undo', 'Undo corner'], ['delete', 'Delete painting'], ['capture', 'Capture images', 'primary'], ['camera', 'Done']],
   testlight: [['paintings', 'Paintings'], ['camera', 'Done', 'primary']],
 };
@@ -784,16 +912,26 @@ $('#out').addEventListener('pointerdown', () => {
 
 // ------------------------------------------------------------------ menu
 
-function openPanel() { $('#panel').hidden = false; renderStatus(); renderCamInfo(); renderPaintList(); }
+function openPanel() {
+  $('#panel').hidden = false;
+  autoLink();
+  renderStatus(); renderCamInfo(); renderPaintList(); renderLinks(); renderPerfStatus(); fillVoices();
+}
 function closePanel() { $('#panel').hidden = true; }
 $('#hotspot').addEventListener('click', () => ($('#panel').hidden ? openPanel() : closePanel()));
 
 const actions = {
   calibrate: runCalibration,
-  camera: () => { closePanel(); setMode('camera'); },
+  camera: () => { closePanel(); setMode('camera'); ensureCamera(); },
   black: () => { closePanel(); setMode('black'); toast('Tap the top-right corner for the menu.', 2000); },
-  paintings: () => { closePanel(); setMode('paintings'); },
-  testlight: () => { closePanel(); setMode('testlight'); },
+  paintings: () => { closePanel(); setMode('paintings'); ensureCamera(); },
+  testlight: () => { closePanel(); setMode('testlight'); ensureCamera(); },
+  perform: startPerformance,
+  pause: () => { if (performer.state === 'paused') performer.resume(); else performer.pause(); },
+  nextstop: () => performer.nextStop(),
+  nextreading: () => performer.nextReading(),
+  stopperform: () => { performer.stop(); closePanel(); setTimeout(() => { if (mode === 'perform') { setMode('camera'); ensureCamera(); } }, 1600); },
+  reloadreadings: () => loadReadings().then(() => toast(`${readingsData.readings.length} readings loaded.`)),
   capture: () => captureImages(),
   'capture-white': () => { settings.captureLight = 'white'; saveSettings(); $('#setCapLight').value = 'white'; captureImages('white'); },
   'capture-black': () => { settings.captureLight = 'black'; saveSettings(); $('#setCapLight').value = 'black'; captureImages('black'); },
@@ -845,7 +983,50 @@ function syncLightControls() {
   $('#setColor').value = settings.light.color;
 }
 
+function fillVoices() {
+  const sel = $('#setVoice');
+  const list = voice.list();
+  sel.innerHTML = list.length
+    ? list.map((v) => `<option value="${esc(v.voiceURI)}">${esc(v.name)} (${esc(v.lang)})</option>`).join('')
+    : '<option value="">Phone default voice</option>';
+  const cur = voice.pick();
+  if (cur) sel.value = cur.voiceURI;
+}
+voice.onvoices = () => fillVoices();
+
 function bindSettings() {
+  // Performance
+  const mv = $('#setMovement');
+  mv.value = settings.perform.movement;
+  mv.addEventListener('change', () => { settings.perform.movement = mv.value; saveSettings(); });
+  const pb = $('#setPauseBetween');
+  const pbOut = () => { $('#o-pauseBetween').textContent = `${settings.perform.pauseBetween} s`; };
+  pb.value = settings.perform.pauseBetween;
+  pbOut();
+  pb.addEventListener('input', () => { settings.perform.pauseBetween = +pb.value; pbOut(); saveSettings(); });
+  $('#links').addEventListener('change', (e) => {
+    const k = e.target?.dataset?.link;
+    if (k == null) return;
+    settings.links[k] = e.target.value || null;
+    saveSettings();
+  });
+
+  // Voice
+  $('#setVoice').addEventListener('change', (e) => {
+    const v = voice.list().find((x) => x.voiceURI === e.target.value);
+    settings.voice.voiceURI = e.target.value || null;
+    if (v) settings.voice.lang = v.lang;
+    saveSettings();
+  });
+  for (const [id, key] of [['#setRate', 'rate'], ['#setPitch', 'pitch']]) {
+    const el = $(id);
+    const out = () => { $(`#o-${key}`).textContent = `${Math.round(settings.voice[key] * 100)}%`; };
+    el.value = settings.voice[key];
+    out();
+    el.addEventListener('input', () => { settings.voice[key] = +el.value; out(); saveSettings(); });
+  }
+  fillVoices();
+
   for (const el of document.querySelectorAll('[data-light]')) {
     el.addEventListener('input', () => setLight({ [el.dataset.light]: +el.value }));
   }
@@ -921,6 +1102,7 @@ function startNote(extra = startExtra) {
   if (visionState === 'failed') parts.push('The vision library did not load. Check the internet and reload.');
   if (calib) parts.push(`Saved calibration from ${timeText(calib.date)}.`);
   if (paintings.list.length) parts.push(`${paintings.list.length} painting(s) saved.`);
+  if (readingsData.readings.length) parts.push(`${readingsData.readings.length} readings ready.`);
   if (extra) parts.push(extra);
   $('#startNote').textContent = parts.join(' ');
 }
@@ -954,13 +1136,16 @@ $('#ver').textContent = VERSION;
 bindSettings();
 startNote();
 setMode('start');
+loadReadings();
 
 // For testing from the browser console.
 window.gaze = {
-  settings, camera, output, vision, light, paintings,
+  settings, camera, output, vision, light, paintings, voice, performer,
   get calib() { return calib; },
   get lastResult() { return lastResult; },
   get mode() { return mode; },
   get visionState() { return visionState; },
+  get readings() { return readingsData; },
   runCalibration, setMode, captureImages, cameraRegionToScreen, showLight,
+  startPerformance, paintingStopToScreen, loadReadings,
 };

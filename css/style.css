@@ -40,7 +40,11 @@ p { margin: 0; }
 #cam { z-index: 2; object-fit: contain; background: #000; filter: brightness(var(--dim)); }
 #overlay { z-index: 3; }
 #light { z-index: 5; background: #000; display: none; }
-body[data-mode="light"] #light { display: block; }
+body[data-mode="light"] #light,
+body[data-mode="perform"] #light { display: block; }
+#links .link { display: flex; gap: 8px; align-items: center; margin-top: 8px; font-size: 14px; }
+#links .link span { flex: 1; min-width: 0; }
+#links select { width: auto; flex: 1; margin-top: 0; }
 
 /* In these modes the projector output sits on top of everything. The camera
    keeps running underneath so frames still arrive for calibration. */

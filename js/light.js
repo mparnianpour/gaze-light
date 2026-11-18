@@ -36,6 +36,10 @@ function rng(seed) {
 }
 const smooth = (x) => { const t = Math.min(1, Math.max(0, x)); return t * t * (3 - 2 * t); };
 const ramp = (a, b, x) => smooth((x - a) / (b - a));
+// Slow start, slow arrival, like an eye drifting from one place to the next.
+const easeInOut = (p) => (p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2);
+const lerp2 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+const lerpRegion = (a, b, t) => ({ center: lerp2(a.center, b.center, t), ax: lerp2(a.ax, b.ax, t), ay: lerp2(a.ay, b.ay, t) });
 
 function hexToRgb(hex) {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
@@ -268,6 +272,26 @@ export class Light {
     return spot;
   }
 
+  // Glide the lit spot to `region` (its shape morphs on the way). With nothing
+  // lit yet, it blooms there instead.
+  moveTo(region, { transition = this.params.transition } = {}) {
+    const now = performance.now() / 1000;
+    const cur = [...this.spots].reverse().find((s) => s.out == null);
+    if (!cur) return this.show(region, { transition });
+    cur.anim = { from: this.regionAt(cur, now), t0: now, dur: transition };
+    cur.region = region;
+    this.start();
+    return cur;
+  }
+
+  // Where a spot is right now (part-way through a glide, or at rest).
+  regionAt(spot, now) {
+    if (!spot.anim) return spot.region;
+    const p = (now - spot.anim.t0) / spot.anim.dur;
+    if (p >= 1) { spot.anim = null; return spot.region; }
+    return lerpRegion(spot.anim.from, spot.region, easeInOut(Math.max(0, p)));
+  }
+
   // Fade everything out.
   clear({ transition = this.params.transition * 0.6 } = {}) {
     const now = performance.now() / 1000;
@@ -295,7 +319,7 @@ export class Light {
   // Turn a spot into dab instances (x, y, radius, weight) in CSS pixels.
   pushDabs(out, n, spot, t, alpha, grow) {
     const P = this.params;
-    const { center, ax, ay } = spot.region;
+    const { center, ax, ay } = this.regionAt(spot, t);
     const unit = Math.sqrt(Math.hypot(ax[0], ax[1]) * Math.hypot(ay[0], ay[1])) * P.size;
     if (!(unit > 0)) return n;
     // Tuned so the light is full out to about half the region, half-bright
@@ -339,6 +363,7 @@ export class Light {
   render() {
     const now = performance.now() / 1000;
     this.spots = this.spots.filter((s) => s.out == null || now - s.out < s.outDur);
+    if (this.spots.length > 6) this.spots = this.spots.slice(-6); // never pile up
     let n = 0;
     for (const s of this.spots) {
       const alpha = s.out == null ? 1 : 1 - smooth((now - s.out) / s.outDur);
