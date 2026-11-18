@@ -49,6 +49,17 @@ Paintings, corners and images are saved on the phone and survive a reload.
 The calibration is saved on the phone. It stays valid as long as the phone, tripod and
 projector don't move and the page is fullscreen.
 
+## Readings
+
+A reading is a journey of 8–12 stops across the paintings. Each stop has a region
+(centre `x`, `y` and size `w`, `h` as fractions of the painting, measured from the canvas
+edges, plus an `angle`), a minimum `dwell` in seconds, and one or two sentences to speak.
+
+Readings written ahead of time live in [`readings/`](readings/), one file per painting.
+`readings/yellow.json` holds 7 readings of the yellow painting, each moving through the
+artist's three movements: *the wind comes, it's taking root, tension comes*.
+The milestone 3 player plays them on the wall; no API key is needed for these.
+
 ## Privacy and keys
 
 Nothing is sent anywhere in milestone 1. From milestone 3 the app calls the Claude API
