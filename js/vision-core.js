@@ -84,6 +84,48 @@
         return res;
       },
 
+      // How much of the picture got brighter than the black reference, and where.
+      // Used to find the projected area when the whole screen flashes white.
+      area({ frame, thresh }) {
+        if (!ref) throw new Error('No black reference frame yet');
+        const g = gray(frame);
+        cv.subtract(g, ref, diff, empty, -1);
+        cv.GaussianBlur(diff, blur, ksize, 0, 0, cv.BORDER_DEFAULT);
+        g.delete();
+        const w = blur.cols;
+        const h = blur.rows;
+        const d = blur.data;
+        const cols = new Uint32Array(w);
+        const rows = new Uint32Array(h);
+        let n = 0, sum = 0, total = 0, peak = 0;
+        for (let y = 0; y < h; y += 2) {
+          const row = y * w;
+          for (let x = 0; x < w; x += 2) {
+            const v = d[row + x];
+            sum += v;
+            total++;
+            if (v > peak) peak = v;
+            if (v >= thresh) { n++; cols[x]++; rows[y]++; }
+          }
+        }
+        // Robust extent: ignore the outermost 2% of bright pixels (stray reflections).
+        const range = (hist, len) => {
+          const lo = n * 0.02, hi = n * 0.98;
+          let acc = 0, a = 0, b = len - 1;
+          for (let i = 0; i < len; i++) { acc += hist[i]; if (acc > lo) { a = i; break; } }
+          acc = 0;
+          for (let i = 0; i < len; i++) { acc += hist[i]; if (acc >= hi) { b = i; break; } }
+          return [a, b + 1];
+        };
+        let bbox = null;
+        if (n) {
+          const [x0, x1] = range(cols, w);
+          const [y0, y1] = range(rows, h);
+          bbox = [x0 / w, y0 / h, x1 / w, y1 / h];
+        }
+        return { frac: n / total, mean: sum / total, peak, bbox, w, h };
+      },
+
       // Homography from src points to dst points: RANSAC to drop outliers,
       // then a least-squares refit on the inliers.
       fit({ src, dst, ransac }) {

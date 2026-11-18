@@ -42,6 +42,37 @@ class DotDetector {
     this.thresh = 20;
     this.noise = 0;
     this.latencies = [];
+    this.peaks = [];   // brightest change seen while each dot was shown (diagnostics)
+  }
+
+  // Flash the whole screen and see where (and whether) the camera picks it up.
+  async findFlash(show, hide, signal) {
+    const thresh = Math.max(this.thresh, 25);
+    const area = async () => this.vision.withFrame('area', await this.grab(), { thresh });
+    show();
+    const t0 = performance.now();
+    let best = null;
+    let seenAt = 0;
+    let brightest = 0;
+    while (performance.now() - t0 < 3000) {
+      throwIfAborted(signal);
+      const a = await area();
+      brightest = Math.max(brightest, a.peak);
+      if (a.frac > 0.01) {
+        if (!seenAt) seenAt = performance.now() - t0;
+        if (!best || a.frac > best.frac) best = a;
+        if (performance.now() - t0 > seenAt + 300) break;
+      }
+    }
+    hide();
+    const t1 = performance.now();
+    while (performance.now() - t1 < 3000) {
+      throwIfAborted(signal);
+      if ((await area()).frac < 0.003) break;
+    }
+    if (!best) return { seen: false, brightest, thresh };
+    this.latencies.push(seenAt);
+    return { seen: true, latency: seenAt, bbox: best.bbox, frac: best.frac, w: best.w, h: best.h, brightest, thresh };
   }
 
   async grab() {
@@ -82,10 +113,12 @@ class DotDetector {
     let run = [];
     let found = null;
     let size = null;
+    let brightest = 0;
     while (performance.now() - t0 < timeout) {
       throwIfAborted(signal);
       const m = await this.measure();
       size = m;
+      brightest = Math.max(brightest, m.peak);
       if (m.peak < this.thresh) { run = []; continue; }
       if (m.fill > 0.6) { run = []; continue; } // a big area changed: not a dot
       const last = run[run.length - 1];
@@ -100,6 +133,7 @@ class DotDetector {
       }
     }
     hide();
+    this.peaks.push(brightest);
     const t1 = performance.now();
     while (performance.now() - t1 < timeout) {
       throwIfAborted(signal);
@@ -128,18 +162,7 @@ async function fit(vision, pts, ransacPx) {
 export async function calibrate({ vision, camera, output, cols = 5, rows = 4, dotR, procW = 1280, signal, onProgress }) {
   const W = output.w;
   const Hs = output.h;
-  const r = Math.max(4, dotR || Math.min(W, Hs) * 0.025);
-  const mx = Math.max(r * 2, W * 0.05);
-  const my = Math.max(r * 2, Hs * 0.06);
-
-  const grid = [];
-  for (let j = 0; j < rows; j++) {
-    for (let i = 0; i < cols; i++) {
-      grid.push({ s: [mx + ((W - 2 * mx) * i) / (cols - 1), my + ((Hs - 2 * my) * j) / (rows - 1)], c: null });
-    }
-  }
-  // Extra dots between the grid points, used only to check the result.
-  const checks = [[0.37, 0.41], [0.63, 0.33], [0.53, 0.69], [0.27, 0.71]].map(([a, b]) => ({ s: [W * a, Hs * b], c: null }));
+  let r = Math.max(4, dotR || Math.min(W, Hs) * 0.04);
 
   const det = new DotDetector(vision, camera, Math.min(procW, camera.width));
   const t0 = performance.now();
@@ -147,10 +170,11 @@ export async function calibrate({ vision, camera, output, cols = 5, rows = 4, do
     ok: false,
     screen: { w: W, h: Hs },
     cam: { w: camera.width, h: camera.height, deviceId: camera.deviceId, label: camera.label },
-    total: grid.length,
+    total: cols * rows,
     dotR: r,
     date: Date.now(),
   };
+  const elapsed = () => (performance.now() - t0) / 1000;
 
   try {
     output.black();
@@ -158,6 +182,47 @@ export async function calibrate({ vision, camera, output, cols = 5, rows = 4, do
     await det.captureRef(4);
     await det.measureNoise(3);
 
+    // 1. Find the projector: flash the whole screen white once.
+    const flash = await det.findFlash(() => output.white(), () => output.black(), signal);
+    base.flash = flash;
+    if (!flash.seen) {
+      return {
+        ...base, found: 0, noise: det.noise, threshold: det.thresh, seconds: elapsed(),
+        reason: 'The camera did not see the projector at all.',
+        hints: [
+          'When the screen flashed white, nothing changed in the camera picture.',
+          'Aim the camera at the projected area: in the camera view you should see the projection (a picture of the picture).',
+          'Check that Smart View is casting and the projector is on.',
+        ],
+      };
+    }
+    // Let the camera recover from the flash, then take a fresh black reference.
+    await sleep(900);
+    throwIfAborted(signal);
+    await det.captureRef(4);
+    await det.measureNoise(3);
+
+    // 2. Make the dots big enough for this camera: at least ~5 camera pixels in radius.
+    const camPxPerScreenPx = ((flash.bbox[2] - flash.bbox[0]) * flash.w) / W;
+    const minR = 5 / Math.max(camPxPerScreenPx, 1e-3);
+    if (r < minR) {
+      r = Math.min(minR, Math.min(W, Hs) * 0.08);
+      base.dotAuto = true;
+    }
+    base.dotR = r;
+
+    const mx = Math.max(r * 2, W * 0.05);
+    const my = Math.max(r * 2, Hs * 0.06);
+    const grid = [];
+    for (let j = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++) {
+        grid.push({ s: [mx + ((W - 2 * mx) * i) / (cols - 1), my + ((Hs - 2 * my) * j) / (rows - 1)], c: null });
+      }
+    }
+    // Extra dots between the grid points, used only to check the result.
+    const checks = [[0.37, 0.41], [0.63, 0.33], [0.53, 0.69], [0.27, 0.71]].map(([a, b]) => ({ s: [W * a, Hs * b], c: null }));
+
+    // 3. One dot at a time.
     for (const [k, p] of grid.entries()) {
       throwIfAborted(signal);
       onProgress?.(k, grid.length);
@@ -168,16 +233,25 @@ export async function calibrate({ vision, camera, output, cols = 5, rows = 4, do
 
     const seen = grid.filter((p) => p.c);
     const pointList = () => grid.map((p) => ({ s: p.s, c: p.c ? [p.c.u, p.c.v] : null, inlier: !!p.inlier }));
-    const result = { ...base, found: seen.length, noise: det.noise, threshold: det.thresh, points: pointList() };
-    const done = (extra) => ({ ...result, ...extra, seconds: (performance.now() - t0) / 1000 });
+    const result = {
+      ...base, found: seen.length, noise: det.noise, threshold: det.thresh, points: pointList(),
+      brightest: det.peaks.length ? Math.max(...det.peaks) : null,
+    };
+    const done = (extra) => ({ ...result, ...extra, seconds: elapsed() });
 
     if (seen.length < 6) {
+      const faint = result.brightest != null && result.brightest < det.thresh;
       return done({
         reason: `The camera saw only ${seen.length} of ${grid.length} dots.`,
-        hints: [
-          'Is Smart View connected, and does the projector light the area the camera sees?',
-          'Make the room darker, or make the dots bigger in the menu.',
-        ],
+        hints: faint
+          ? [
+            'The camera sees the projector (outlined), but the dots looked too faint.',
+            'Make the room darker, or make the dots bigger in the menu.',
+          ]
+          : [
+            'Only part of the projection may be in the camera view (outlined). Aim the camera so it sees more of it.',
+            'Keep people and moving things out of the view while it runs.',
+          ],
       });
     }
 

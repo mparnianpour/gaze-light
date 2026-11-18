@@ -113,18 +113,38 @@ export class Camera {
   // Chrome silently ignores what it can't do, so each lock is checked afterwards.
   async lock() {
     const out = { exposure: 'unsupported', whiteBalance: 'unsupported', focus: 'unsupported' };
+    this.lockInfo = {};
     if (!this.track) return out;
     const caps = this.capabilities();
     this.lockedValues = {};
     for (const [key, mode, value] of LOCKABLE) {
       if (!Array.isArray(caps[mode]) || !caps[mode].includes('manual')) continue;
       const cur = this.settings();
-      const c = { [mode]: 'manual' };
-      if (caps[value] && cur[value] != null) c[value] = cur[value];
-      try { await this.track.applyConstraints({ advanced: [c] }); } catch { /* checked below */ }
-      const after = this.settings();
-      out[key] = after[mode] === 'manual' ? 'locked' : 'failed';
-      if (out[key] === 'locked' && after[value] != null) this.lockedValues[value] = after[value];
+      // First ask for "manual" alone (Chrome then holds the current value);
+      // if that doesn't take, ask again with the current value spelled out.
+      const tries = [{ [mode]: 'manual' }];
+      if (caps[value] && cur[value] != null) tries.push({ [mode]: 'manual', [value]: cur[value] });
+      out[key] = 'failed';
+      let note = '';
+      for (const c of tries) {
+        try {
+          await this.track.applyConstraints({ advanced: [c] });
+        } catch (e) {
+          note = `${e.name}${e.constraint ? ' on ' + e.constraint : ''}`;
+        }
+        await sleep(300); // settings are reported a moment later
+        const after = this.settings();
+        if (after[mode] === 'manual') {
+          out[key] = 'locked';
+          if (after[value] != null) this.lockedValues[value] = after[value];
+          break;
+        }
+      }
+      if (out[key] !== 'locked') {
+        const after = this.settings();
+        this.lockInfo[key] = `modes ${caps[mode].join('/')}, now ${after[mode] ?? '?'}` +
+          (caps[value] ? `, ${value} ${cur[value] ?? '?'}` : '') + (note ? `, ${note}` : '');
+      }
     }
     this.locks = out;
     return out;

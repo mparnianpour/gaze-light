@@ -107,6 +107,7 @@ body:not([data-mode="result"]) #card { display: none; }
 #card p { margin: 4px 0; }
 #card ul { margin: 4px 0; padding-left: 18px; color: var(--warn); font-size: 14px; }
 #card .row { margin-top: 10px; }
+#card summary { cursor: pointer; padding: 2px 0; }
 
 /* ---- toast ---- */
 #msg {

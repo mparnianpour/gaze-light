@@ -7,9 +7,14 @@ import { calibrate, applyH } from './calibrate.js';
 const VERSION = 'Milestone 1';
 const KEY_SETTINGS = 'gaze.settings';
 const KEY_CALIB = 'gaze.calibration';
-const DEFAULTS = { deviceId: null, camHeight: 1080, grid: '5x4', dotSize: 2.5, previewDim: 0.6 };
+const DEFAULTS = { v: 2, deviceId: null, camHeight: 1080, grid: '5x4', dotSize: 4, previewDim: 0.6 };
 
 const settings = { ...DEFAULTS, ...load(KEY_SETTINGS, {}) };
+if ((settings.v || 1) < 2) {
+  // The first version used smaller dots by default.
+  if (settings.dotSize === 2.5) settings.dotSize = DEFAULTS.dotSize;
+  settings.v = 2;
+}
 const saveSettings = () => save(KEY_SETTINGS, settings);
 
 const body = document.body;
@@ -173,6 +178,15 @@ function renderCard() {
   if (r.checkErr != null) stats.push(`check error ${r.checkErr.toFixed(1)} px`);
   if (r.seconds != null) stats.push(`${Math.round(r.seconds)} s`);
   const locks = lockText(r.locks).map(([t, k]) => `<span class="chip ${k}">${esc(t)}</span>`).join('');
+  // Numbers that help diagnose a failed calibration.
+  const diag = [];
+  if (r.flash?.seen) diag.push(`projector seen, delay ${(r.flash.latency / 1000).toFixed(2)} s, ${Math.round(r.flash.frac * 100)}% of view`);
+  else if (r.flash) diag.push(`projector not seen (brightest change ${Math.round(r.flash.brightest)}, needed ${Math.round(r.flash.thresh)})`);
+  if (r.brightest != null) diag.push(`brightest dot ${Math.round(r.brightest)} (needed ${Math.round(r.threshold)})`);
+  if (r.noise != null) diag.push(`noise ${Math.round(r.noise)}`);
+  if (r.dotR) diag.push(`dot radius ${Math.round(r.dotR)} px${r.dotAuto ? ' (enlarged for this camera)' : ''}`);
+  if (r.cam) diag.push(`${r.cam.label || 'camera'} ${r.cam.w}×${r.cam.h}`);
+  const lockInfo = r.lockInfo ? Object.entries(r.lockInfo).map(([k, v]) => `${k}: ${v}`).join(' · ') : '';
   card.innerHTML = `
     <div class="title ${r.ok ? 'ok' : 'bad'}">${r.ok ? '✓ Calibrated' : '✗ Calibration failed'}</div>
     ${r.ok ? '' : `<p>${esc(r.reason || '')}</p>`}
@@ -180,7 +194,11 @@ function renderCard() {
     <p class="small">${esc(stats.join(' · '))}. <span class="muted">1 px is one phone-screen pixel, about ${(100 / output.w).toFixed(2)}% of the projected width.</span></p>
     ${r.warnings?.length ? `<ul>${r.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}
     ${locks ? `<div class="chips" style="margin-top:6px">${locks}</div>` : ''}
-    ${r.ok ? '<p class="small" style="margin-top:8px">Tap anything in the camera view. The screen goes dark and a cross is projected onto that spot. Press Done to tap anywhere in the full view.</p>' : ''}
+    <details class="muted small" style="margin-top:6px" ${r.ok ? '' : 'open'}>
+      <summary>Details</summary>
+      ${esc(diag.join(' · '))}${lockInfo ? `<br>Camera controls: ${esc(lockInfo)}` : ''}
+    </details>
+    ${r.ok ? '<p class="small" style="margin-top:8px">Tap the camera view: a cross is projected onto that spot. Done shows the full view.</p>' : ''}
     ${!r.ok && calib ? '<p class="muted small">Your previous calibration is still in use.</p>' : ''}
     <div class="row">
       <button data-act="calibrate" class="${r.ok ? '' : 'primary'}">Redo</button>
@@ -203,6 +221,21 @@ function drawOverlay() {
 
   const c = mode === 'result' && lastResult ? lastResult : calib;
   if (!c) return;
+
+  // Without a fit yet: show where the camera saw the projector's white flash.
+  if (mode === 'result' && !c.Hinv && c.flash?.bbox) {
+    const [u0, v0, u1, v1] = c.flash.bbox;
+    const [x0, y0] = camToView(u0, v0);
+    const [x1, y1] = camToView(u1, v1);
+    g.setLineDash([8, 6]);
+    g.lineWidth = 2;
+    g.strokeStyle = 'rgba(236, 214, 171, 0.9)';
+    g.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    g.setLineDash([]);
+    g.fillStyle = 'rgba(236, 214, 171, 0.95)';
+    g.font = '13px system-ui, sans-serif';
+    g.fillText('projector light seen here', x0 + 6, Math.max(14, y0 - 6));
+  }
 
   // Outline of what the projector can reach, as seen by the camera.
   if (c.Hinv) {
@@ -311,6 +344,7 @@ async function runCalibration() {
     lastResult = await calibrate({ vision, camera, output, cols, rows, dotR, signal });
     lastResult.locks = camera.locks;
     lastResult.lockValues = camera.lockedValues;
+    lastResult.lockInfo = camera.lockInfo;
   } catch (e) {
     abortCal = null;
     if (e.name === 'AbortError') {
