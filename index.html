@@ -73,6 +73,15 @@
             <option value="new">Only new</option>
           </select>
         </label>
+        <label>Colours
+          <select id="setColours">
+            <option value="painting">From the painting's own hues</option>
+            <option value="presets">Preset palettes</option>
+          </select>
+        </label>
+        <label id="chromaRow">Chroma <span id="o-chroma" class="muted"></span>
+          <input type="range" id="setChroma" min="0.2" max="1" step="0.05">
+        </label>
         <label>Hold each <span id="o-hold" class="muted"></span>
           <input type="range" data-seg="hold" min="3" max="120" step="1">
         </label>

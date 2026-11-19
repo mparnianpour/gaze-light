@@ -62,6 +62,10 @@ painting gets soft neutral light. One composition crossfades into the next.
 4. While it plays: **♥ Save this composition** keeps the one on the wall; *Compositions*
    chooses new, saved, or both. Hold time, crossfade, colour coverage, light on the rest of
    the painting and colour brightness are adjustable.
+5. *Colours*: **From the painting's own hues** (default) measures the painting's main hues
+   (after correcting the photo's white balance) and builds palettes from them, every colour
+   at the chosen **Chroma**: a share of the most saturated colour possible at that hue and
+   lightness (OKLCH), 70% by default. Or use the preset palettes.
 
 ## Using milestone 3 (gaze)
 

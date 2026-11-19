@@ -9,7 +9,7 @@ import { Paintings } from './paintings.js';
 import { Voice } from './speech.js';
 import { Performer, SegmentPerformer } from './perform.js';
 import { SegmentLight, SEG_DEFAULTS } from './seglight.js';
-import { generate, saveComposition, clearCompositions, usableSaved, savedCompositions } from './compose.js';
+import { generate, saveComposition, clearCompositions, usableSaved, savedCompositions, paintingHues, chromaPalettes } from './compose.js';
 
 const VERSION = 'Segments · step 1';
 const KEY_SETTINGS = 'gaze.settings';
@@ -336,8 +336,35 @@ async function prepareSegments() {
   if (!entries.length) { toast('Could not find segments. Try Capture images again.', 5000); return null; }
   seglight.buildMap(entries, calib.Hinv, output.w, output.h);
   const segAt = Object.fromEntries(entries.map((e) => [e.pid, e.seg.at]));
-  segState = { entries, segAt };
+  segState = { entries, segAt, hues: [], palettes: null };
+  await updatePalettes();
   return segState;
+}
+
+// Colours from the paintings' own hues (white-balanced) at the chosen chroma.
+async function updatePalettes() {
+  if (!segState) return;
+  if (settings.seg.colours !== 'painting') { segState.palettes = null; return; }
+  if (!segState.hues.length) {
+    const hues = [];
+    for (const e of segState.entries) {
+      const img = await paintings.imageData(paintings.get(e.pid), 400);
+      if (img) hues.push(...paintingHues(img));
+    }
+    // keep the strongest few, at least 20° apart
+    hues.sort((a, b) => b.weight - a.weight);
+    for (const h of hues) {
+      if (segState.hues.length >= 7) break;
+      if (segState.hues.every((k) => Math.min(Math.abs(k.hue - h.hue), 360 - Math.abs(k.hue - h.hue)) > 20)) segState.hues.push(h);
+    }
+  }
+  let hues = segState.hues;
+  if (hues.length === 1) {
+    // One main hue: add its neighbours and its opposite, so there is still a palette.
+    const h0 = hues[0];
+    hues = [h0, { hue: (h0.hue + 35) % 360, L: h0.L }, { hue: (h0.hue + 325) % 360, L: h0.L }, { hue: (h0.hue + 180) % 360, L: 0.5 }];
+  }
+  segState.palettes = hues.length >= 2 ? chromaPalettes(hues, { chroma: settings.seg.chroma, count: 12, seed: Date.now() % 100000 }) : null;
 }
 
 function compositionPixels(comp) {
@@ -354,7 +381,7 @@ function nextComposition() {
   if (saved.length && (src === 'saved' || (src === 'mix' && Math.random() < 0.35))) {
     comp = saved[savedCursor++ % saved.length];
   } else {
-    comp = generate(segState.entries.map((e) => ({ pid: e.pid, seg: e.seg })), { cover: settings.seg.cover, avoid: lastPalette });
+    comp = generate(segState.entries.map((e) => ({ pid: e.pid, seg: e.seg })), { cover: settings.seg.cover, avoid: lastPalette, palettes: segState.palettes });
   }
   lastPalette = comp.palette;
   return { comp, pixels: compositionPixels(comp) };
@@ -1186,6 +1213,16 @@ function bindSettings() {
   const srcSel = $('#setSource');
   srcSel.value = settings.seg.source;
   srcSel.addEventListener('change', () => { settings.seg.source = srcSel.value; saveSettings(); });
+  const colSel = $('#setColours');
+  colSel.value = settings.seg.colours;
+  colSel.addEventListener('change', () => { settings.seg.colours = colSel.value; saveSettings(); updatePalettes(); $('#chromaRow').hidden = colSel.value !== 'painting'; });
+  $('#chromaRow').hidden = settings.seg.colours !== 'painting';
+  const chroma = $('#setChroma');
+  const chromaOut = () => { $('#o-chroma').textContent = `${Math.round(settings.seg.chroma * 100)}%`; };
+  chroma.value = settings.seg.chroma;
+  chromaOut();
+  chroma.addEventListener('input', () => { settings.seg.chroma = +chroma.value; chromaOut(); saveSettings(); });
+  chroma.addEventListener('change', () => updatePalettes());
   renderSegStatus();
 
   // Gaze

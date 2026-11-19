@@ -14,6 +14,8 @@ export const SEG_DEFAULTS = {
   fade: 6,         // seconds of crossfade
   cover: 0.5,      // share of each painting filled with colour
   source: 'mix',   // 'mix' | 'saved' | 'new'
+  colours: 'painting', // 'painting' (its own hues) | 'presets'
+  chroma: 0.7,     // share of the most saturated colour possible, for painting colours
 };
 
 const hex = (h) => [1, 3, 5].map((o) => parseInt(h.slice(o, o + 2), 16) / 255);
